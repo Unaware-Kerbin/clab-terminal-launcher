@@ -1,0 +1,26 @@
+# Local / generated — never commit personal lab settings or secrets
+.config/
+*.local
+*.vault
+credentials.vault
+asbru-clab/
+
+# Python virtualenvs (embed absolute paths / username — never publish)
+clab/
+venv/
+.venv/
+env/
+ENV/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store

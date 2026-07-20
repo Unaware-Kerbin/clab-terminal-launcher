@@ -1,0 +1,804 @@
+#!/usr/bin/env bash
+# clab-ssh — discover Containerlab devices and open SSH sessions
+#
+# Linux/macOS entry point. See clab-ssh.ps1 for Windows.
+#
+# Usage:
+#   ./clab-ssh
+#   ./clab-ssh -t native
+#   ./clab-ssh -t securecrt pe-1 ce-1
+#   ./clab-ssh -l
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="${SCRIPT_DIR}/lib"
+
+# Host is never hardcoded — loaded from env, -H, or ~/.config/clab-ssh/config
+CLAB_HOST="${CLAB_HOST:-}"
+CLAB_USER="${CLAB_USER:-admin}"
+SSH_USER="${SSH_USER:-}"
+HOST_FROM_FLAG=0
+SSH_USER_FROM_FLAG=0
+LIST_ONLY=0
+NO_JUMP=0
+SAVE_DEVICE_CREDS=0
+FORGET_DEVICE_CREDS=0
+NO_DEVICE_CREDS=0
+LAUNCHER="${CLAB_LAUNCHER:-}"
+ASBRU_BIN="${ASBRU_BIN:-}"
+ASBRU_CFG_DIR="${ASBRU_CFG_DIR:-$HOME/asbru-clab}"
+SECURECRT_BIN="${SECURECRT_BIN:-}"
+SECURECRT_JUMP_SESSION="${SECURECRT_JUMP_SESSION:-}"
+PUTTY_BIN="${PUTTY_BIN:-}"
+PUTTY_JUMP_SESSION="${PUTTY_JUMP_SESSION:-}"
+TERMINAL_CMD="${TERMINAL_CMD:-}"
+
+# Device credentials loaded once from the vault, shared across launchers.
+DEVICE_USER=""
+DEVICE_PASSWORD=""
+DEVICE_CREDS_LOADED=0
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options] [node ...]
+
+Discover Containerlab devices and open SSH sessions.
+Default device username: ${CLAB_USER}
+
+Options:
+  -h, --help              Show this help
+  -l, --list              List running nodes only
+  -H, --host HOST         Containerlab host (saved for next runs)
+  -U, --ssh-user U        Linux username on the clab host
+  -u, --user USER         Device SSH username (default: ${CLAB_USER})
+  -t, --launcher NAME     asbru|securecrt|putty|native|wt|powershell|cmd
+  --list-launchers        Show which launchers are available here
+  --no-jump               Connect directly (no jump host)
+  --save-device-creds     Save/update encrypted device user+password (Ásbrú)
+  --forget-device-creds   Delete local credential vault
+  --no-device-creds       Skip vault; prompt for device passwords in Ásbrú
+  --asbru PATH            Ásbrú binary
+  --securecrt PATH        SecureCRT binary
+  --putty PATH            PuTTY binary
+  --jump-session NAME     SecureCRT/PuTTY saved jump session (optional)
+
+Environment:
+  CLAB_HOST, CLAB_USER, SSH_USER, CLAB_LAUNCHER, CLAB_SSH_CONFIG
+  ASBRU_BIN, ASBRU_CFG_DIR
+  SECURECRT_BIN, SECURECRT_JUMP_SESSION
+  PUTTY_BIN, PUTTY_JUMP_SESSION
+  TERMINAL_CMD
+
+Local settings (never committed to git):
+  ~/.config/clab-ssh/config              host / ssh user
+  ~/.config/clab-ssh/credentials.vault   encrypted device credentials (Ásbrú)
+EOF
+}
+
+NODES=()
+LIST_LAUNCHERS=0
+
+need_arg() {
+  if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+    echo "Option $1 requires a value." >&2
+    usage >&2
+    exit 1
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -l|--list) LIST_ONLY=1; shift ;;
+    --list-launchers) LIST_LAUNCHERS=1; shift ;;
+    -H|--host) need_arg "$@"; CLAB_HOST="$2"; HOST_FROM_FLAG=1; shift 2 ;;
+    -U|--ssh-user) need_arg "$@"; SSH_USER="$2"; SSH_USER_FROM_FLAG=1; shift 2 ;;
+    -u|--user) need_arg "$@"; CLAB_USER="$2"; shift 2 ;;
+    -t|--launcher) need_arg "$@"; LAUNCHER="$2"; shift 2 ;;
+    --no-jump) NO_JUMP=1; shift ;;
+    --save-device-creds) SAVE_DEVICE_CREDS=1; shift ;;
+    --forget-device-creds) FORGET_DEVICE_CREDS=1; shift ;;
+    --no-device-creds) NO_DEVICE_CREDS=1; shift ;;
+    --asbru) need_arg "$@"; ASBRU_BIN="$2"; shift 2 ;;
+    --securecrt) need_arg "$@"; SECURECRT_BIN="$2"; shift 2 ;;
+    --putty) need_arg "$@"; PUTTY_BIN="$2"; shift 2 ;;
+    --jump-session)
+      need_arg "$@"
+      SECURECRT_JUMP_SESSION="$2"
+      PUTTY_JUMP_SESSION="$2"
+      shift 2
+      ;;
+    --) shift; NODES+=("$@"); break ;;
+    -*) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    *) NODES+=("$1"); shift ;;
+  esac
+done
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing required command: $1" >&2
+    exit 1
+  }
+}
+
+need python3
+
+if [[ "$LIST_LAUNCHERS" -eq 1 ]]; then
+  python3 "${LIB_DIR}/list_launchers.py"
+  exit 0
+fi
+
+if [[ "$FORGET_DEVICE_CREDS" -eq 1 ]]; then
+  python3 "${LIB_DIR}/credentials.py" forget
+  echo "Device credential vault removed (if it existed)."
+  # Allow combining with a normal launch; otherwise exit after forget-only.
+  if [[ "$SAVE_DEVICE_CREDS" -eq 0 && -z "${LAUNCHER}" && "$LIST_ONLY" -eq 0 && ${#NODES[@]} -eq 0 ]]; then
+    exit 0
+  fi
+fi
+
+need ssh
+
+# Resolve CLAB_HOST: env / -H / saved config / prompt (then persist)
+if [[ -z "$CLAB_HOST" ]]; then
+  CLAB_HOST="$(python3 "${LIB_DIR}/user_config.py" get CLAB_HOST)"
+fi
+if [[ -z "$CLAB_HOST" ]]; then
+  read -r -p "Containerlab host IP/hostname: " CLAB_HOST
+  CLAB_HOST="$(echo "$CLAB_HOST" | tr -d '[:space:]')"
+  if [[ -z "$CLAB_HOST" ]]; then
+    echo "Host is required." >&2
+    exit 1
+  fi
+  python3 "${LIB_DIR}/user_config.py" set CLAB_HOST "$CLAB_HOST" >/dev/null
+  echo "Saved host to $(python3 "${LIB_DIR}/user_config.py" path)"
+elif [[ "$HOST_FROM_FLAG" -eq 1 ]]; then
+  python3 "${LIB_DIR}/user_config.py" set CLAB_HOST "$CLAB_HOST" >/dev/null
+fi
+
+# Resolve SSH_USER: env / -U / saved config / prompt (then persist)
+if [[ -z "$SSH_USER" ]]; then
+  SSH_USER="$(python3 "${LIB_DIR}/user_config.py" get SSH_USER)"
+fi
+if [[ -z "$SSH_USER" ]]; then
+  default_user="$(whoami)"
+  read -r -p "Username for Containerlab host ${CLAB_HOST} [${default_user}]: " SSH_USER
+  SSH_USER="${SSH_USER:-$default_user}"
+  python3 "${LIB_DIR}/user_config.py" set SSH_USER "$SSH_USER" >/dev/null
+elif [[ "$SSH_USER_FROM_FLAG" -eq 1 ]]; then
+  python3 "${LIB_DIR}/user_config.py" set SSH_USER "$SSH_USER" >/dev/null
+fi
+
+JUMP_TARGET="${SSH_USER}@${CLAB_HOST}"
+CONTROL_PATH=""
+SOCKS_PORT=""
+
+# Open one jump tunnel (password once): ControlMaster for discovery + SOCKS for Ásbrú.
+open_jump_master() {
+  local cm_dir askpass jump_password known_hosts
+  cm_dir="${HOME}/.config/clab-ssh/ssh-cm"
+  mkdir -p "$cm_dir"
+  chmod 700 "$cm_dir" 2>/dev/null || true
+  CONTROL_PATH="${cm_dir}/control"
+  known_hosts="${HOME}/.config/clab-ssh/known_hosts"
+  mkdir -p "$(dirname "$known_hosts")"
+  touch "$known_hosts"
+  chmod 600 "$known_hosts" 2>/dev/null || true
+
+  ssh -O exit -S "$CONTROL_PATH" "$JUMP_TARGET" >/dev/null 2>&1 || true
+  rm -f "$CONTROL_PATH"
+
+  SOCKS_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+
+  echo
+  echo "Jump host password for ${JUMP_TARGET} (once for this run):"
+  read -r -s -p "Password: " jump_password
+  echo
+  if [[ -z "$jump_password" ]]; then
+    echo "Jump password is required." >&2
+    exit 1
+  fi
+
+  askpass="$(mktemp)"
+  cat >"$askpass" <<'ASK'
+#!/bin/sh
+printf '%s\n' "$CLAB_JUMP_PASSWORD"
+ASK
+  chmod 700 "$askpass"
+  export CLAB_JUMP_PASSWORD="$jump_password"
+  export SSH_ASKPASS="$askpass"
+  export SSH_ASKPASS_REQUIRE=force
+
+  # -D = local SOCKS for Ásbrú (snap cannot use host ControlMaster sockets)
+  if ! ssh -fN -M -S "$CONTROL_PATH" \
+    -D "127.0.0.1:${SOCKS_PORT}" \
+    -o StrictHostKeyChecking=accept-new \
+    -o "UserKnownHostsFile=${known_hosts}" \
+    -o GlobalKnownHostsFile=/dev/null \
+    -o UpdateHostkeys=no \
+    -o NumberOfPasswordPrompts=1 \
+    -o PreferredAuthentications=password,keyboard-interactive \
+    "$JUMP_TARGET"; then
+    unset CLAB_JUMP_PASSWORD SSH_ASKPASS SSH_ASKPASS_REQUIRE
+    rm -f "$askpass"
+    echo "Failed to open jump tunnel to ${JUMP_TARGET}." >&2
+    exit 1
+  fi
+  unset CLAB_JUMP_PASSWORD SSH_ASKPASS SSH_ASKPASS_REQUIRE
+  rm -f "$askpass"
+  jump_password=""
+  echo "Jump tunnel ready (SOCKS 127.0.0.1:${SOCKS_PORT})."
+}
+
+if [[ "$NO_JUMP" -eq 0 ]]; then
+  open_jump_master
+fi
+
+DISCOVER_ARGS=(--host "$CLAB_HOST" --ssh-user "$SSH_USER" --format jsonl)
+[[ -n "$CONTROL_PATH" ]] && DISCOVER_ARGS+=(--control-path "$CONTROL_PATH")
+for f in "${NODES[@]+"${NODES[@]}"}"; do
+  [[ -n "$f" ]] && DISCOVER_ARGS+=(--filter "$f")
+done
+
+mapfile -t DEVICE_JSON_LINES < <(python3 "${LIB_DIR}/discover.py" "${DISCOVER_ARGS[@]}") || {
+  echo "Discovery failed." >&2
+  exit 1
+}
+
+if [[ ${#DEVICE_JSON_LINES[@]} -eq 0 ]]; then
+  echo "No running nodes with management IPv4 found." >&2
+  exit 1
+fi
+
+print_table() {
+  printf "%-28s %-16s %-28s %s\n" "NAME" "SHORT" "KIND" "MGMT IPv4"
+  printf "%-28s %-16s %-28s %s\n" "----" "-----" "----" "--------"
+  for line in "${DEVICE_JSON_LINES[@]}"; do
+    python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("%-28s %-16s %-28s %s" % (d["long"], d["short"], d["kind"], d["ip"]))' "$line"
+  done
+}
+
+echo
+print_table
+echo
+
+if [[ "$LIST_ONLY" -eq 1 ]]; then
+  exit 0
+fi
+
+DEVICES_JSON="$(printf '%s\n' "${DEVICE_JSON_LINES[@]}" | python3 -c 'import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))')"
+
+detect_default_launcher() {
+  local uname_s
+  uname_s="$(uname -s 2>/dev/null || echo unknown)"
+  case "$uname_s" in
+    Linux*)
+      if command -v asbru >/dev/null 2>&1 || command -v asbru-cm >/dev/null 2>&1; then
+        echo asbru
+      else
+        echo native
+      fi
+      ;;
+    Darwin*)
+      echo native
+      ;;
+    *)
+      echo native
+      ;;
+  esac
+}
+
+if [[ -z "$LAUNCHER" ]]; then
+  LAUNCHER="$(detect_default_launcher)"
+fi
+
+LAUNCHER="$(echo "$LAUNCHER" | tr '[:upper:]' '[:lower:]')"
+
+resolve_asbru() {
+  if [[ -n "$ASBRU_BIN" ]]; then
+    return 0
+  fi
+  if command -v asbru >/dev/null 2>&1; then
+    ASBRU_BIN="$(command -v asbru)"
+  elif command -v asbru-cm >/dev/null 2>&1; then
+    ASBRU_BIN="$(command -v asbru-cm)"
+  else
+    echo "Ásbrú not found. Install asbru-cm or set ASBRU_BIN / use -t native." >&2
+    exit 1
+  fi
+}
+
+resolve_securecrt() {
+  if [[ -n "$SECURECRT_BIN" ]]; then
+    return 0
+  fi
+  local c
+  for c in securecrt SecureCRT SecureCRT.exe \
+    "/Applications/SecureCRT.app/Contents/MacOS/SecureCRT" \
+    "/mnt/c/Program Files/VanDyke Software/SecureCRT/SecureCRT.exe" \
+    "/mnt/c/Program Files (x86)/VanDyke Software/SecureCRT/SecureCRT.exe"; do
+    if command -v "$c" >/dev/null 2>&1; then
+      SECURECRT_BIN="$(command -v "$c")"
+      return 0
+    fi
+    if [[ -x "$c" ]]; then
+      SECURECRT_BIN="$c"
+      return 0
+    fi
+  done
+  echo "SecureCRT not found. Set SECURECRT_BIN or --securecrt." >&2
+  exit 1
+}
+
+resolve_putty() {
+  if [[ -n "$PUTTY_BIN" ]]; then
+    return 0
+  fi
+  local c
+  for c in putty putty.exe \
+    "/mnt/c/Program Files/PuTTY/putty.exe" \
+    "/mnt/c/Program Files (x86)/PuTTY/putty.exe"; do
+    if command -v "$c" >/dev/null 2>&1; then
+      PUTTY_BIN="$(command -v "$c")"
+      return 0
+    fi
+    if [[ -x "$c" ]]; then
+      PUTTY_BIN="$c"
+      return 0
+    fi
+  done
+  echo "PuTTY not found. Set PUTTY_BIN or --putty." >&2
+  exit 1
+}
+
+ssh_argv_for() {
+  # prints ssh args as a single shell-quoted string suitable for -x / -Command
+  #   $1 = device IP
+  #   $2 = reuse_master (1 = reuse the already-open jump ControlMaster via a
+  #        ProxyCommand so the jump password is entered only once; 0 = plain -J).
+  #        Use 0 for Windows ssh.exe (wt/powershell/cmd), which cannot use a unix
+  #        control socket.
+  local ip="$1"
+  local reuse_master="${2:-0}"
+  local args=(ssh -o StrictHostKeyChecking=accept-new -l "$CLAB_USER")
+  if [[ "$NO_JUMP" -eq 0 ]]; then
+    if [[ "$reuse_master" -eq 1 && -n "$CONTROL_PATH" && -S "$CONTROL_PATH" ]]; then
+      args+=(-o "ProxyCommand=ssh -o ControlPath=${CONTROL_PATH} -o ControlMaster=no -W %h:%p ${JUMP_TARGET}")
+    else
+      args+=(-J "$JUMP_TARGET")
+    fi
+  fi
+  args+=("$ip")
+  python3 -c 'import shlex,sys; print(shlex.join(sys.argv[1:]))' "${args[@]}"
+}
+
+launch_native_one() {
+  local name="$1" ip="$2"
+  local force_wt="${3:-0}"
+  local ssh_cmd
+  # Linux/macOS terminals run native ssh, which can reuse the jump ControlMaster
+  # (single jump password). The wt.exe/powershell.exe fallbacks below build their
+  # own -J command since they invoke Windows ssh.exe.
+  ssh_cmd="$(ssh_argv_for "$ip" 1)"
+  # Autofill the device password via sshpass -f (file-based; not exposed in ps).
+  # Only for the native ssh path — the Windows-ssh fallbacks below can't use it.
+  if [[ "$force_wt" -ne 1 && -n "$DEVICE_PASSWORD" ]] && command -v sshpass >/dev/null 2>&1; then
+    local _pwf
+    if _pwf="$(mk_pw_file "$DEVICE_PASSWORD")"; then
+      ssh_cmd="sshpass -f $(printf '%q' "$_pwf") ${ssh_cmd}"
+    fi
+  fi
+  echo "→ ${name} (${ip}) via native ssh"
+
+  if [[ -n "$TERMINAL_CMD" ]]; then
+    # shellcheck disable=SC2086
+    eval "$TERMINAL_CMD" "$ssh_cmd" &
+    return 0
+  fi
+
+  if [[ "$force_wt" -eq 1 ]]; then
+    if command -v wt.exe >/dev/null 2>&1; then
+      wt.exe new-tab --title "clab:${name}" ssh -o StrictHostKeyChecking=accept-new -l "$CLAB_USER" \
+        $([[ "$NO_JUMP" -eq 0 ]] && printf '%s %s' -J "$JUMP_TARGET") "$ip" &
+      return 0
+    fi
+    if command -v wt >/dev/null 2>&1; then
+      wt new-tab --title "clab:${name}" ssh -o StrictHostKeyChecking=accept-new -l "$CLAB_USER" \
+        $([[ "$NO_JUMP" -eq 0 ]] && printf '%s %s' -J "$JUMP_TARGET") "$ip" &
+      return 0
+    fi
+    echo "Windows Terminal (wt) not found; falling back to native." >&2
+  fi
+
+  if command -v ptyxis >/dev/null 2>&1; then
+    ptyxis --new-window --title "clab:${name}" -x "$ssh_cmd" >/dev/null 2>&1 &
+  elif command -v gnome-terminal >/dev/null 2>&1; then
+    gnome-terminal --title="clab:${name}" -- bash -lc "$ssh_cmd; echo; read -r -p 'Press Enter...'" &
+  elif command -v konsole >/dev/null 2>&1; then
+    konsole -p tabtitle="clab:${name}" -e bash -lc "$ssh_cmd" &
+  elif command -v xfce4-terminal >/dev/null 2>&1; then
+    xfce4-terminal --title="clab:${name}" -e "bash -lc $(printf '%q' "$ssh_cmd")" &
+  elif command -v mate-terminal >/dev/null 2>&1; then
+    mate-terminal --title="clab:${name}" -e "bash -lc $(printf '%q' "$ssh_cmd")" &
+  elif command -v kitty >/dev/null 2>&1; then
+    kitty --title "clab:${name}" bash -lc "$ssh_cmd" &
+  elif command -v alacritty >/dev/null 2>&1; then
+    alacritty --title "clab:${name}" -e bash -lc "$ssh_cmd" &
+  elif command -v x-terminal-emulator >/dev/null 2>&1; then
+    x-terminal-emulator -T "clab:${name}" -e bash -lc "$ssh_cmd; echo; read -r -p 'Press Enter...'" &
+  elif [[ "$(uname -s)" == "Darwin" ]]; then
+    if [[ -d "/Applications/iTerm.app" ]]; then
+      osascript <<EOF &
+tell application "iTerm"
+  create window with default profile
+  tell current session of current window
+    write text "$ssh_cmd"
+  end tell
+  activate
+end tell
+EOF
+    else
+      osascript <<EOF &
+tell application "Terminal"
+  do script "$ssh_cmd"
+  activate
+end tell
+EOF
+    fi
+  elif command -v wt.exe >/dev/null 2>&1; then
+    wt.exe new-tab --title "clab:${name}" ssh -o StrictHostKeyChecking=accept-new -l "$CLAB_USER" \
+      $([[ "$NO_JUMP" -eq 0 ]] && printf '%s %s' -J "$JUMP_TARGET") "$ip" &
+  elif command -v powershell.exe >/dev/null 2>&1; then
+    local ssh_args_json
+    ssh_args_json="$(python3 -c 'import json,sys; print(",".join(json.dumps(a) for a in sys.argv[1:]))' \
+      -o StrictHostKeyChecking=accept-new -l "$CLAB_USER" \
+      $([[ "$NO_JUMP" -eq 0 ]] && echo -J "$JUMP_TARGET") "$ip")"
+    powershell.exe -NoProfile -Command "Start-Process ssh -ArgumentList @($ssh_args_json)" &
+  elif command -v pwsh >/dev/null 2>&1; then
+    pwsh -NoProfile -Command "Start-Process -FilePath ssh -ArgumentList @($(python3 -c 'import json,sys; print(",".join(json.dumps(a) for a in sys.argv[1:]))' -o StrictHostKeyChecking=accept-new -l "$CLAB_USER" $([[ "$NO_JUMP" -eq 0 ]] && echo -J "$JUMP_TARGET") "$ip"))" &
+  else
+    echo "  (no GUI terminal found — opening in current shell)"
+    # shellcheck disable=SC2086
+    eval "$ssh_cmd" || true
+  fi
+}
+
+# Load device credentials from the local encrypted vault into DEVICE_USER /
+# DEVICE_PASSWORD (may prompt to create/unlock). Shared by every launcher that
+# can autofill. Honors --no-device-creds / --save-device-creds. Runs at most once.
+load_device_credentials() {
+  [[ "$DEVICE_CREDS_LOADED" -eq 1 ]] && return 0
+  DEVICE_CREDS_LOADED=1
+  DEVICE_USER="$CLAB_USER"
+  DEVICE_PASSWORD=""
+  local vault_json vault_exists ans
+
+  # credentials.py prints prompts on stderr; stdout is a single JSON object.
+  apply_vault_json() {
+    local raw="$1"
+    local parsed
+    parsed="$(printf '%s' "$raw" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+for line in reversed(raw.splitlines()):
+    line = line.strip()
+    if line.startswith("{") and line.endswith("}"):
+        d = json.loads(line)
+        print(d["device_user"])
+        print(d["device_password"])
+        raise SystemExit(0)
+raise SystemExit("no JSON credential payload on stdout")
+')" || return 1
+    DEVICE_USER="$(printf '%s\n' "$parsed" | sed -n '1p')"
+    DEVICE_PASSWORD="$(printf '%s\n' "$parsed" | sed -n '2p')"
+  }
+
+  if [[ "$NO_DEVICE_CREDS" -eq 1 ]]; then
+    echo "Skipping device credential vault (--no-device-creds)."
+  else
+    vault_exists="$(python3 "${LIB_DIR}/credentials.py" exists)"
+    if [[ "$SAVE_DEVICE_CREDS" -eq 1 || "$vault_exists" == "0" ]]; then
+      if [[ "$SAVE_DEVICE_CREDS" -eq 0 ]]; then
+        read -r -p "Save encrypted device credentials for autofill? [Y/n]: " ans
+        ans="$(echo "${ans:-Y}" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$ans" != "y" && "$ans" != "yes" ]]; then
+          echo "Continuing without saved device credentials (you'll be prompted)."
+          vault_exists="skip"
+        fi
+      fi
+      if [[ "$vault_exists" != "skip" ]]; then
+        if vault_json="$(CLAB_USER="$CLAB_USER" python3 "${LIB_DIR}/credentials.py" set)" \
+          && apply_vault_json "$vault_json"; then
+          :
+        else
+          echo "Could not save/parse device credentials; continuing without autofill." >&2
+          DEVICE_PASSWORD=""
+        fi
+      fi
+    else
+      if vault_json="$(python3 "${LIB_DIR}/credentials.py" get)" \
+        && apply_vault_json "$vault_json"; then
+        :
+      else
+        echo "Could not unlock credential vault." >&2
+        read -r -p "Re-save credentials? [y/N]: " ans
+        ans="$(echo "${ans:-N}" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$ans" == "y" || "$ans" == "yes" ]]; then
+          if vault_json="$(CLAB_USER="$CLAB_USER" python3 "${LIB_DIR}/credentials.py" set)" \
+            && apply_vault_json "$vault_json"; then
+            :
+          else
+            echo "Continuing without autofill." >&2
+            DEVICE_PASSWORD=""
+          fi
+        else
+          echo "Continuing without autofill." >&2
+        fi
+      fi
+    fi
+  fi
+
+  [[ -n "$DEVICE_USER" ]] && CLAB_USER="$DEVICE_USER"
+  vault_json=""
+  return 0
+}
+
+# Write a password to a private temp file (0600) for sshpass -f / putty -pwfile.
+# Avoids exposing the password in the process list. The file is shredded a few
+# seconds after launch, once the client has read it. Prints the file path.
+mk_pw_file() {
+  local pw="$1" f
+  [[ -z "$pw" ]] && return 1
+  f="$(mktemp "${TMPDIR:-/tmp}/clab-pw.XXXXXX")" || return 1
+  chmod 600 "$f" 2>/dev/null || true
+  printf '%s\n' "$pw" >"$f"
+  ( sleep 10; shred -u "$f" 2>/dev/null || rm -f "$f" ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  printf '%s' "$f"
+}
+
+launch_asbru() {
+  resolve_asbru
+
+  load_device_credentials
+  local device_user="$DEVICE_USER"
+  local device_password="$DEVICE_PASSWORD"
+
+  # Reuse the jump tunnel opened before discovery (SOCKS for Ásbrú snap).
+  local control_path="${CONTROL_PATH:-}"
+  local socks_port="${SOCKS_PORT:-}"
+  if [[ "$NO_JUMP" -eq 0 && -z "$socks_port" ]]; then
+    echo "No jump tunnel available; opening one now."
+    open_jump_master
+    control_path="${CONTROL_PATH:-}"
+    socks_port="${SOCKS_PORT:-}"
+  fi
+  if [[ "$NO_JUMP" -eq 0 && -z "$socks_port" ]]; then
+    echo "Jump SOCKS tunnel is required for Ásbrú." >&2
+    exit 1
+  fi
+
+  mkdir -p "$ASBRU_CFG_DIR"
+  touch "${ASBRU_CFG_DIR}/known_hosts"
+  chmod 600 "${ASBRU_CFG_DIR}/known_hosts" 2>/dev/null || true
+
+  local uuids
+  local extra=()
+  [[ "$NO_JUMP" -eq 1 ]] && extra+=(--no-jump)
+  [[ -n "$socks_port" ]] && extra+=(--socks-port "$socks_port")
+
+  if [[ -n "$device_password" ]]; then
+    export CLAB_DEVICE_PASSWORD="$device_password"
+  else
+    unset CLAB_DEVICE_PASSWORD || true
+  fi
+
+  uuids="$(python3 "${LIB_DIR}/asbru_config.py" \
+    --cfg-dir "$ASBRU_CFG_DIR" \
+    --host "$CLAB_HOST" \
+    --ssh-user "$SSH_USER" \
+    --device-user "$device_user" \
+    --devices-json "$DEVICES_JSON" \
+    "${extra[@]+"${extra[@]}"}")"
+  unset CLAB_DEVICE_PASSWORD || true
+  device_password=""
+  vault_json=""
+
+  uuids="$(echo "$uuids" | tr -d '\r')"
+  uuids="$(printf '%s\n' "$uuids" | awk 'NF{line=$0} END{print line}')"
+  if [[ -z "$uuids" ]]; then
+    echo "Failed to build Ásbrú connections." >&2
+    exit 1
+  fi
+
+  local args=(--config-dir="$ASBRU_CFG_DIR" --no-splash)
+  local u
+  for u in $uuids; do
+    args+=(--start-uuid="$u")
+  done
+
+  echo "Launching Ásbrú (${#DEVICE_JSON_LINES[@]} session(s))..."
+  if pgrep -f '[a]sbru-cm|/snap/asbru/.*/bin/asbru' >/dev/null 2>&1; then
+    echo "Ásbrú is already running — restarting with clab connections..."
+    pkill -f '[a]sbru-cm|/snap/asbru/.*/bin/asbru' 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      pgrep -f '[a]sbru-cm|/snap/asbru/.*/bin/asbru' >/dev/null 2>&1 || break
+      sleep 0.25
+    done
+    sleep 0.5
+  fi
+
+  "$ASBRU_BIN" "${args[@]}" &
+  local pid=$!
+  disown "$pid" 2>/dev/null || true
+  sleep 1.5
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "Ásbrú started (pid $pid)."
+    if [[ -n "$socks_port" ]]; then
+      echo "Jump SOCKS: 127.0.0.1:${socks_port} (keep this tunnel up while using Ásbrú)."
+    fi
+  else
+    echo "Ásbrú exited immediately. Try: $ASBRU_BIN ${args[*]}" >&2
+    [[ -n "$control_path" ]] && ssh -O exit -S "$control_path" "$JUMP_TARGET" 2>/dev/null || true
+    exit 1
+  fi
+}
+
+launch_securecrt() {
+  resolve_securecrt
+  # Without a saved jump session, fall back to OpenSSH ProxyJump in the OS terminal
+  # so sessions still work on every platform.
+  if [[ "$NO_JUMP" -eq 0 && -z "$SECURECRT_JUMP_SESSION" ]]; then
+    echo "Note: no SecureCRT jump session set; using OpenSSH ProxyJump (native) for connectivity." >&2
+    echo "Set --jump-session / SECURECRT_JUMP_SESSION to use SecureCRT's firewall jump." >&2
+    launch_native
+    return 0
+  fi
+  local line name ip
+  for line in "${DEVICE_JSON_LINES[@]}"; do
+    name="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["short"])' "$line")"
+    ip="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ip"])' "$line")"
+    echo "→ ${name} (${ip}) via SecureCRT"
+    local cmd=("$SECURECRT_BIN" /T /ssh2 "$ip" /l "$CLAB_USER" /P 22 /accepthostkeys)
+    if [[ "$NO_JUMP" -eq 0 ]]; then
+      cmd=( "$SECURECRT_BIN" /T "/firewall=Session:${SECURECRT_JUMP_SESSION}" /ssh2 "$ip" /l "$CLAB_USER" /P 22 /accepthostkeys )
+    fi
+    "${cmd[@]}" >/dev/null 2>&1 &
+    sleep 0.15
+  done
+  echo "Launched ${#DEVICE_JSON_LINES[@]} SecureCRT session(s)."
+}
+
+launch_putty() {
+  resolve_putty
+  local line name ip
+  local use_proxycmd=0
+  if [[ "$NO_JUMP" -eq 0 && -z "$PUTTY_JUMP_SESSION" ]]; then
+    echo "Note: no PuTTY jump session set; using OpenSSH ProxyCommand (-proxycmd)." >&2
+    use_proxycmd=1
+  fi
+  # Password autofill uses PuTTY's -pwfile (0.77+), which reads the password from
+  # a private file rather than argv. Windows putty.exe can't read a WSL/Unix path,
+  # so autofill is limited to native (non-.exe) PuTTY builds.
+  local putty_autofill=0
+  if [[ "$PUTTY_BIN" != *.exe ]]; then
+    load_device_credentials
+    if [[ -n "$DEVICE_PASSWORD" ]]; then
+      putty_autofill=1
+      echo "Device password autofill: enabled (PuTTY -pwfile; requires PuTTY 0.77+)."
+    fi
+  fi
+  for line in "${DEVICE_JSON_LINES[@]}"; do
+    name="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["short"])' "$line")"
+    ip="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ip"])' "$line")"
+    echo "→ ${name} (${ip}) via PuTTY"
+    local cmd=("$PUTTY_BIN" -ssh -P 22 -l "$CLAB_USER" -loghost "$name")
+    if [[ "$putty_autofill" -eq 1 ]]; then
+      local _pwf
+      if _pwf="$(mk_pw_file "$DEVICE_PASSWORD")"; then
+        cmd+=(-pwfile "$_pwf")
+      fi
+    fi
+    if [[ "$NO_JUMP" -eq 0 ]]; then
+      if [[ "$use_proxycmd" -eq 1 ]]; then
+        # Works on Windows/WSL/Linux whenever ssh is available — no saved session required.
+        # On Linux/macOS PuTTY the proxy ssh can reuse our jump ControlMaster (no extra
+        # jump password). Windows putty.exe invokes Windows ssh.exe, which rejects
+        # ControlPath, so keep the plain form there.
+        if [[ -n "$CONTROL_PATH" && -S "$CONTROL_PATH" && "$PUTTY_BIN" != *.exe ]]; then
+          cmd+=(-proxycmd "ssh -o ControlPath=${CONTROL_PATH} -o ControlMaster=no -W %host:%port -o StrictHostKeyChecking=accept-new ${JUMP_TARGET}")
+        else
+          cmd+=(-proxycmd "ssh -W %host:%port -o StrictHostKeyChecking=accept-new ${JUMP_TARGET}")
+        fi
+      else
+        cmd+=(-load "$PUTTY_JUMP_SESSION")
+      fi
+    fi
+    cmd+=("$ip")
+    "${cmd[@]}" >/dev/null 2>&1 &
+    sleep 0.15
+  done
+  echo "Launched ${#DEVICE_JSON_LINES[@]} PuTTY session(s)."
+}
+
+launch_native() {
+  local force_wt="${1:-0}"
+  # Offer vault autofill only when native ssh + sshpass are usable (not for the
+  # wt/Windows-ssh path, which has no non-interactive password mechanism).
+  if [[ "$force_wt" -ne 1 ]] && command -v sshpass >/dev/null 2>&1; then
+    load_device_credentials
+    [[ -n "$DEVICE_PASSWORD" ]] && echo "Device password autofill: enabled (sshpass)."
+  fi
+  local line name ip
+  for line in "${DEVICE_JSON_LINES[@]}"; do
+    name="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["short"])' "$line")"
+    ip="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ip"])' "$line")"
+    launch_native_one "$name" "$ip" "$force_wt"
+    sleep 0.15
+  done
+  echo "Launched ${#DEVICE_JSON_LINES[@]} native SSH session(s)."
+}
+
+launch_windows_shell() {
+  local shell_kind="$1" # powershell | cmd
+  local ps_exe cmd_exe
+  ps_exe="$(command -v powershell.exe 2>/dev/null || command -v pwsh.exe 2>/dev/null || command -v pwsh 2>/dev/null || command -v powershell 2>/dev/null || true)"
+  cmd_exe="$(command -v cmd.exe 2>/dev/null || true)"
+
+  if [[ "$shell_kind" == "powershell" && -z "$ps_exe" ]]; then
+    echo "PowerShell not found (powershell.exe / pwsh)." >&2
+    exit 1
+  fi
+  if [[ "$shell_kind" == "cmd" && -z "$cmd_exe" ]]; then
+    echo "cmd.exe not found (are you on Windows/WSL?)." >&2
+    exit 1
+  fi
+
+  local line name ip ssh_cmd
+  for line in "${DEVICE_JSON_LINES[@]}"; do
+    name="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["short"])' "$line")"
+    ip="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ip"])' "$line")"
+    # Windows ssh.exe cannot use a unix control socket — keep plain -J.
+    ssh_cmd="$(ssh_argv_for "$ip" 0)"
+    echo "→ ${name} (${ip}) via ${shell_kind}"
+    if [[ "$shell_kind" == "powershell" ]]; then
+      if [[ "$(basename "$ps_exe")" == "powershell.exe" || "$(basename "$ps_exe")" == "pwsh.exe" ]]; then
+        "$ps_exe" -NoProfile -Command "Start-Process powershell -ArgumentList '-NoExit','-Command','${ssh_cmd//\'/\'\'}'" &
+      else
+        # Native pwsh on Linux/macOS: new window when possible, else current
+        "$ps_exe" -NoExit -Command "$ssh_cmd" &
+      fi
+    else
+      "$cmd_exe" /c start "clab:${name}" cmd /k "$ssh_cmd" &
+    fi
+    sleep 0.15
+  done
+  echo "Launched ${#DEVICE_JSON_LINES[@]} ${shell_kind} session(s)."
+}
+
+echo "Launcher: ${LAUNCHER}"
+echo "Device user: ${CLAB_USER}"
+if [[ "$NO_JUMP" -eq 0 ]]; then
+  echo "Jump host: ${JUMP_TARGET}"
+else
+  echo "Jump host: (none)"
+fi
+echo "Jump tunnel already opened (device passwords autofill for asbru; native/putty where supported)."
+echo
+
+case "$LAUNCHER" in
+  asbru) launch_asbru ;;
+  securecrt) launch_securecrt ;;
+  putty) launch_putty ;;
+  native) launch_native 0 ;;
+  wt) launch_native 1 ;;
+  powershell) launch_windows_shell powershell ;;
+  cmd) launch_windows_shell cmd ;;
+  *)
+    echo "Unknown launcher: $LAUNCHER" >&2
+    echo "Use: asbru|securecrt|putty|native|wt|powershell|cmd" >&2
+    echo "See: ./clab-ssh --list-launchers" >&2
+    exit 1
+    ;;
+esac
