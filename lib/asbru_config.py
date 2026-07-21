@@ -97,25 +97,44 @@ def write_asbru_config(
                 pass
 
     home = pathlib.Path.home()
-    base_candidates = [
-        home / "snap/asbru/current/.config/asbru/asbru.yml",
-        home / ".config/asbru/asbru.yml",
-        pathlib.Path("/snap/asbru/current/bin/res/asbru.yml"),
-    ]
-    base_path = next((p for p in base_candidates if p.is_file()), None)
-    if base_path is None:
-        raise SystemExit("Could not find a base Ásbrú asbru.yml to clone")
+    out = cfg_dir / "asbru.yml"
 
-    cfg = yaml.safe_load(base_path.read_text(encoding="utf-8"))
-    if not isinstance(cfg, dict) or "environments" not in cfg:
-        raise SystemExit(f"Invalid base Ásbrú config: {base_path}")
+    # Reuse the existing generated config as the base so the user's global
+    # settings / preferences (and any environments they added here) survive
+    # across runs. Only clone Ásbrú's template on the very first run.
+    bootstrap = True
+    cfg = None
+    if out.is_file():
+        try:
+            loaded = yaml.safe_load(out.read_text(encoding="utf-8"))
+        except Exception:
+            loaded = None
+        if isinstance(loaded, dict) and "environments" in loaded:
+            cfg = loaded
+            bootstrap = False
+
+    if cfg is None:
+        base_candidates = [
+            home / "snap/asbru/current/.config/asbru/asbru.yml",
+            home / ".config/asbru/asbru.yml",
+            pathlib.Path("/snap/asbru/current/bin/res/asbru.yml"),
+        ]
+        base_path = next((p for p in base_candidates if p.is_file()), None)
+        if base_path is None:
+            raise SystemExit("Could not find a base Ásbrú asbru.yml to clone")
+        cfg = yaml.safe_load(base_path.read_text(encoding="utf-8"))
+        if not isinstance(cfg, dict) or "environments" not in cfg:
+            raise SystemExit(f"Invalid base Ásbrú config: {base_path}")
 
     cfg.setdefault("defaults", {})
-    cfg["defaults"]["allow more instances"] = 1
-    cfg["defaults"]["open connections in tabs"] = 1
-    cfg["defaults"]["tabs in main window"] = 1
-    cfg["defaults"]["confirm exit"] = 0
-    cfg["defaults"]["session logs folder"] = str(cfg_dir / "session_logs")
+    # Impose our workflow defaults only when bootstrapping; on later runs leave
+    # the user's global settings untouched so GUI edits stick.
+    if bootstrap:
+        cfg["defaults"]["allow more instances"] = 1
+        cfg["defaults"]["open connections in tabs"] = 1
+        cfg["defaults"]["tabs in main window"] = 1
+        cfg["defaults"]["confirm exit"] = 0
+        cfg["defaults"]["session logs folder"] = str(cfg_dir / "session_logs")
 
     envs = cfg.setdefault("environments", {})
     shell = envs.get("__PAC_SHELL__")
@@ -127,9 +146,30 @@ def write_asbru_config(
 
     group_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"clab-group.{clab_host}"))
 
-    keep = {"__PAC__ROOT__", "__PAC_SHELL__"}
-    new_envs = {k: v for k, v in envs.items() if k in keep}
-    if shell:
+    if bootstrap:
+        # Fresh clab config dir: keep only the structural roots (don't import the
+        # user's unrelated connections from the template).
+        new_envs = {
+            k: v for k, v in envs.items() if k in ("__PAC__ROOT__", "__PAC_SHELL__")
+        }
+    else:
+        # Preserve everything except our previous clab group and the connections
+        # that belonged to it (rebuilt below from current discovery).
+        old_group = envs.get(group_uuid)
+        old_children = (
+            set((old_group or {}).get("children", {}))
+            if isinstance(old_group, dict)
+            else set()
+        )
+
+        def _is_ours(uid: str, env: object) -> bool:
+            if uid == group_uuid or uid in old_children:
+                return True
+            return isinstance(env, dict) and env.get("parent") == group_uuid
+
+        new_envs = {k: v for k, v in envs.items() if not _is_ours(k, v)}
+
+    if shell is not None:
         new_envs["__PAC_SHELL__"] = shell
     new_envs["__PAC__ROOT__"] = (
         root
@@ -145,7 +185,12 @@ def write_asbru_config(
     )
     root = new_envs["__PAC__ROOT__"]
     root.setdefault("children", {})
-    root["children"] = {"__PAC_SHELL__": 1, group_uuid: 1}
+    if bootstrap:
+        root["children"] = {"__PAC_SHELL__": 1, group_uuid: 1}
+    else:
+        # Keep the user's other top-level items; ensure our group + shell exist.
+        root["children"].setdefault("__PAC_SHELL__", 1)
+        root["children"][group_uuid] = 1
 
     children: dict[str, int] = {}
     new_envs[group_uuid] = {
@@ -230,7 +275,13 @@ def write_asbru_config(
         # use proxy: 0=global, 1=SOCKS(Ásbrú-managed), 2=never, 3=jump
         proxy_mode = 3 if use_asbru_jump else 2
 
-        conn = copy.deepcopy(shell) if shell else {}
+        # On an update run, keep the previously generated connection as the base
+        # so per-connection GUI tweaks (terminal options, macros, expect, etc.)
+        # survive; only the connectivity fields below get refreshed.
+        prev = envs.get(conn_uuid) if not bootstrap else None
+        conn = copy.deepcopy(prev) if isinstance(prev, dict) else (
+            copy.deepcopy(shell) if shell else {}
+        )
         conn.update(
             {
                 "KPX title regexp": f".*{device['short']}.*",
@@ -240,17 +291,10 @@ def write_asbru_config(
                 "auth type": "userpass" if use_autofill else "manual",
                 "autoreconnect": 0,
                 "autossh": 0,
-                "cluster": [],
                 "description": f"{device['long']} ({device['kind']}) via {clab_host}",
                 "embed": 0,
-                "expect": [],
-                "favourite": 0,
                 "ip": device["ip"],
-                "local after": [],
-                "local before": [],
-                "local connected": [],
                 "mac": "",
-                "macros": [],
                 "method": "ssh",
                 "name": device["short"],
                 "title": device["short"],
@@ -267,17 +311,28 @@ def write_asbru_config(
                 "proxy port": 8080,
                 "proxy user": "",
                 "proxy pass": "",
-                "screenshots": [],
-                "variables": [],
                 "session logs folder": str(cfg_dir / "session_logs"),
-                "terminal options": {
-                    "open in tab": 1,
-                    "use personal settings": 1,
-                    "terminal window hsize": 900,
-                    "terminal window vsize": 600,
-                },
             }
         )
+        # Make clab connections inherit the global terminal appearance (colors,
+        # font, window size, etc.) so edits in Ásbrú Preferences apply to every
+        # device. Ásbrú reads per-connection appearance only when
+        # "use personal settings" is on (PACTerminal.pm), otherwise it falls back
+        # to `defaults`. We force it off: these connections are auto-generated,
+        # so the user configures appearance once, globally.
+        if not isinstance(conn.get("terminal options"), dict):
+            conn["terminal options"] = {}
+        conn["terminal options"].setdefault("open in tab", 1)
+        conn["terminal options"]["use personal settings"] = 0
+        conn.setdefault("cluster", [])
+        conn.setdefault("expect", [])
+        conn.setdefault("favourite", 0)
+        conn.setdefault("local after", [])
+        conn.setdefault("local before", [])
+        conn.setdefault("local connected", [])
+        conn.setdefault("macros", [])
+        conn.setdefault("screenshots", [])
+        conn.setdefault("variables", [])
         if use_asbru_jump:
             conn["jump ip"] = clab_host
             conn["jump port"] = 22
@@ -308,7 +363,6 @@ def write_asbru_config(
     except OSError:
         pass
 
-    out = cfg_dir / "asbru.yml"
     with out.open("w", encoding="utf-8") as f:
         yaml.safe_dump(
             cfg,
@@ -335,7 +389,10 @@ def write_asbru_config(
     elif jump_password and not no_jump:
         print("Jump password: set for Ásbrú built-in jump", file=sys.stderr)
     print(f"SSH known_hosts: {known_hosts_path}", file=sys.stderr)
-    print(f"Base config: {base_path}", file=sys.stderr)
+    if bootstrap:
+        print("Config: created new (cloned from Ásbrú template)", file=sys.stderr)
+    else:
+        print("Config: updated existing (global settings preserved)", file=sys.stderr)
     return start_uuids
 
 
