@@ -33,6 +33,16 @@ SECURECRT_JUMP_SESSION="${SECURECRT_JUMP_SESSION:-}"
 PUTTY_BIN="${PUTTY_BIN:-}"
 PUTTY_JUMP_SESSION="${PUTTY_JUMP_SESSION:-}"
 TERMINAL_CMD="${TERMINAL_CMD:-}"
+WIRESHARK_BIN="${WIRESHARK_BIN:-}"
+CAPTURE_IFACE="${CAPTURE_IFACE:-}"
+CAPTURE_FILTER="${CAPTURE_FILTER:-}"
+CAPTURE_SUDO=0
+EDGESHARK_PORT="${EDGESHARK_PORT:-5001}"
+EDGESHARK_LOCAL_PORT="${EDGESHARK_LOCAL_PORT:-}"
+EDGESHARK_INSTALL=0
+EDGESHARK_NO_OPEN=0
+EDGESHARK_DIRECT=0
+EDGESHARK_TUNNEL=0
 
 # Device credentials loaded once from the vault, shared across launchers.
 DEVICE_USER=""
@@ -52,7 +62,7 @@ Options:
   -H, --host HOST         Containerlab host (saved for next runs)
   -U, --ssh-user U        Linux username on the clab host
   -u, --user USER         Device SSH username (default: ${CLAB_USER})
-  -t, --launcher NAME     asbru|securecrt|putty|native|wt|powershell|cmd
+  -t, --launcher NAME     asbru|securecrt|putty|native|wt|powershell|cmd|wireshark|edgeshark
   --list-launchers        Show which launchers are available here
   --no-jump               Connect directly (no jump host)
   --save-device-creds     Save/update encrypted device user+password (Ásbrú)
@@ -63,12 +73,28 @@ Options:
   --putty PATH            PuTTY binary
   --jump-session NAME     SecureCRT/PuTTY saved jump session (optional)
 
+Packet capture (-t wireshark):
+  --wireshark PATH        Local Wireshark binary
+  --capture-iface IFACE   Node interface to capture (e.g. e1-1, eth1); else prompt
+  --capture-filter BPF    Optional tcpdump/BPF filter (e.g. 'tcp port 179')
+  --capture-sudo          Run 'ip netns exec' via sudo on the clab host
+
+Edgeshark (-t edgeshark): open the Edgeshark web UI (direct if reachable,
+                          else forwarded through the jump host)
+  --edgeshark-install     Deploy Edgeshark on the clab host first
+  --edgeshark-direct      Force a direct connection to the host's port
+  --edgeshark-tunnel      Force forwarding through the jump tunnel
+  --edgeshark-port N      Edgeshark port on the clab host (default 5001)
+  --edgeshark-local-port N  Local port for the tunnel (default: same, else auto)
+  --no-open               Do not open the browser automatically
+
 Environment:
   CLAB_HOST, CLAB_USER, SSH_USER, CLAB_LAUNCHER, CLAB_SSH_CONFIG
   ASBRU_BIN, ASBRU_CFG_DIR
   SECURECRT_BIN, SECURECRT_JUMP_SESSION
   PUTTY_BIN, PUTTY_JUMP_SESSION
   TERMINAL_CMD
+  WIRESHARK_BIN, CAPTURE_IFACE, CAPTURE_FILTER
 
 Local settings (never committed to git):
   ~/.config/clab-ssh/config              host / ssh user
@@ -103,6 +129,16 @@ while [[ $# -gt 0 ]]; do
     --asbru) need_arg "$@"; ASBRU_BIN="$2"; shift 2 ;;
     --securecrt) need_arg "$@"; SECURECRT_BIN="$2"; shift 2 ;;
     --putty) need_arg "$@"; PUTTY_BIN="$2"; shift 2 ;;
+    --wireshark) need_arg "$@"; WIRESHARK_BIN="$2"; shift 2 ;;
+    --capture-iface) need_arg "$@"; CAPTURE_IFACE="$2"; shift 2 ;;
+    --capture-filter) need_arg "$@"; CAPTURE_FILTER="$2"; shift 2 ;;
+    --capture-sudo) CAPTURE_SUDO=1; shift ;;
+    --edgeshark-port) need_arg "$@"; EDGESHARK_PORT="$2"; shift 2 ;;
+    --edgeshark-local-port) need_arg "$@"; EDGESHARK_LOCAL_PORT="$2"; shift 2 ;;
+    --edgeshark-install) EDGESHARK_INSTALL=1; shift ;;
+    --edgeshark-direct) EDGESHARK_DIRECT=1; shift ;;
+    --edgeshark-tunnel) EDGESHARK_TUNNEL=1; shift ;;
+    --no-open) EDGESHARK_NO_OPEN=1; shift ;;
     --jump-session)
       need_arg "$@"
       SECURECRT_JUMP_SESSION="$2"
@@ -121,6 +157,22 @@ need() {
     exit 1
   }
 }
+
+# Refuse to run as root/sudo. Local root is never needed (the jump SSH uses your
+# login; remote netns/docker use *remote* sudo). Running under sudo makes the
+# saved config in ~/.config/clab-ssh and the GUI hand-off (Wireshark/Edgeshark,
+# Ásbrú) unusable by your normal desktop session — the classic "capture window
+# closes instantly" symptom.
+if [[ "${EUID:-$(id -u)}" -eq 0 && "${CLAB_ALLOW_ROOT:-0}" != "1" ]]; then
+  echo "Refusing to run as root/sudo." >&2
+  echo "Run clab-ssh as your normal desktop user — local root is not needed." >&2
+  echo "  • jump / device SSH uses your own login" >&2
+  echo "  • remote packet capture escalates with sudo on the clab host only" >&2
+  echo "If a previous sudo run left root-owned files, fix them once with:" >&2
+  echo "  sudo chown -R \"\$USER:\$USER\" ~/.config/clab-ssh" >&2
+  echo "(Override only if you really know why: CLAB_ALLOW_ROOT=1)" >&2
+  exit 1
+fi
 
 need python3
 
@@ -777,6 +829,423 @@ launch_windows_shell() {
   echo "Launched ${#DEVICE_JSON_LINES[@]} ${shell_kind} session(s)."
 }
 
+resolve_wireshark() {
+  if [[ -n "$WIRESHARK_BIN" ]]; then
+    return 0
+  fi
+  local c
+  for c in wireshark \
+    "/Applications/Wireshark.app/Contents/MacOS/Wireshark" \
+    "/mnt/c/Program Files/Wireshark/wireshark.exe" \
+    "/mnt/c/Program Files (x86)/Wireshark/wireshark.exe" \
+    wireshark.exe; do
+    if command -v "$c" >/dev/null 2>&1; then
+      WIRESHARK_BIN="$(command -v "$c")"
+      return 0
+    fi
+    if [[ -x "$c" ]]; then
+      WIRESHARK_BIN="$c"
+      return 0
+    fi
+  done
+  echo "Wireshark not found. Install wireshark or set WIRESHARK_BIN / --wireshark." >&2
+  exit 1
+}
+
+# Capture reuses the jump ControlMaster (no extra password) and always targets
+# the clab host itself, where the node network namespaces live.
+CAP_SSH_OPTS=()
+CAP_SUDO_PW=""    # set only when interactive sudo is required
+CAP_PRIV=""       # privilege prefix: "" | "sudo -n " | "sudo -S -p '' "
+
+# Run a remote command on the clab host, quietly, returning its exit status.
+cap_ssh_ok() {
+  ssh "${CAP_SSH_OPTS[@]}" "$JUMP_TARGET" "$1" </dev/null >/dev/null 2>&1
+}
+
+# Run a remote command and stream its stdout. Feeds the sudo password on stdin
+# (never argv) when interactive sudo is in use.
+cap_run() {
+  local remote="${CAP_PRIV}$1"
+  if [[ -n "$CAP_SUDO_PW" ]]; then
+    printf '%s\n' "$CAP_SUDO_PW" | ssh "${CAP_SSH_OPTS[@]}" "$JUMP_TARGET" "$remote"
+  else
+    ssh "${CAP_SSH_OPTS[@]}" "$JUMP_TARGET" "$remote" </dev/null
+  fi
+}
+
+# Decide how to gain root on the clab host for a given operation. Sets CAP_PRIV
+# (prefix to put before the privileged command) and CAP_SUDO_PW (when an
+# interactive sudo password is needed). $1 = cheap remote test command, $2 =
+# human label. Order: run directly (root login) → passwordless sudo → prompt.
+determine_priv_for() {
+  local test_cmd="$1" label="${2:-privileged commands}"
+  CAP_PRIV=""
+  CAP_SUDO_PW=""
+  if [[ "$CAPTURE_SUDO" -eq 1 ]]; then
+    read -r -s -p "sudo password for ${JUMP_TARGET}: " CAP_SUDO_PW
+    echo
+    CAP_PRIV="sudo -S -p '' "
+    return 0
+  fi
+  if cap_ssh_ok "$test_cmd"; then
+    CAP_PRIV=""
+    return 0
+  fi
+  if cap_ssh_ok "sudo -n ${test_cmd}"; then
+    CAP_PRIV="sudo -n "
+    echo "Using passwordless sudo on ${CLAB_HOST}."
+    return 0
+  fi
+  echo "Root is required for ${label} on ${CLAB_HOST}."
+  read -r -s -p "sudo password for ${JUMP_TARGET}: " CAP_SUDO_PW
+  echo
+  CAP_PRIV="sudo -S -p '' "
+  return 0
+}
+
+determine_capture_priv() {
+  echo "Checking capture privileges on ${CLAB_HOST}..."
+  determine_priv_for "ip netns exec $1 true" "'ip netns exec'"
+}
+
+launch_wireshark() {
+  resolve_wireshark
+  need ssh
+
+  CAP_SSH_OPTS=(-o StrictHostKeyChecking=accept-new)
+  if [[ -n "$CONTROL_PATH" && -S "$CONTROL_PATH" ]]; then
+    CAP_SSH_OPTS+=(-o "ControlPath=${CONTROL_PATH}" -o ControlMaster=no)
+  fi
+
+  # Choose the node (netns = container long name). Prompt only when ambiguous.
+  local cap_long cap_short line s l
+  if [[ ${#DEVICE_JSON_LINES[@]} -eq 1 ]]; then
+    cap_long="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["long"])' "${DEVICE_JSON_LINES[0]}")"
+    cap_short="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["short"])' "${DEVICE_JSON_LINES[0]}")"
+  else
+    echo "Select a node to capture:"
+    local i=1
+    for line in "${DEVICE_JSON_LINES[@]}"; do
+      s="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["short"])' "$line")"
+      l="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["long"])' "$line")"
+      printf "  %2d) %-16s %s\n" "$i" "$s" "$l"
+      i=$((i + 1))
+    done
+    local sel
+    read -r -p "Node number [1]: " sel
+    sel="${sel:-1}"
+    if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#DEVICE_JSON_LINES[@]} )); then
+      echo "Invalid selection." >&2
+      exit 1
+    fi
+    line="${DEVICE_JSON_LINES[$((sel - 1))]}"
+    cap_long="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["long"])' "$line")"
+    cap_short="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["short"])' "$line")"
+  fi
+
+  local cap_ns_q
+  cap_ns_q="$(printf '%q' "$cap_long")"
+  determine_capture_priv "$cap_ns_q"
+
+  # Fetch the namespace's interfaces so we can validate / offer choices. Node
+  # kinds name interfaces differently (SR Linux e1-1, vrnetlab/vJunos eth1,
+  # Linux eth1...), so never assume — always check what actually exists.
+  local names=() n ifaces
+  if ifaces="$(cap_run "ip netns exec ${cap_ns_q} ip -br link" 2>/dev/null)"; then
+    while IFS= read -r n; do
+      n="${n%%[[:space:]]*}"   # first column
+      n="${n%%@*}"             # strip @ifNN peer suffix
+      [[ -z "$n" ]] && continue
+      names+=("$n")
+    done < <(printf '%s\n' "$ifaces")
+  fi
+
+  local iface="$CAPTURE_IFACE"
+  # A requested interface that doesn't exist would dead-end in Wireshark
+  # ("No such device"); catch it here and fall back to the real list.
+  if [[ -n "$iface" && ${#names[@]} -gt 0 ]]; then
+    local found=0
+    for n in "${names[@]}"; do
+      [[ "$n" == "$iface" ]] && found=1 && break
+    done
+    if [[ "$found" -eq 0 ]]; then
+      echo "Interface '${iface}' not found on ${cap_short}." >&2
+      iface=""
+    fi
+  fi
+  if [[ -z "$iface" ]]; then
+    if [[ ${#names[@]} -gt 0 ]]; then
+      echo "Interfaces on ${cap_short} (${cap_long}):"
+      for n in "${names[@]}"; do
+        printf "   - %s\n" "$n"
+      done
+    else
+      echo "Could not list interfaces on ${cap_short} (enter one manually)." >&2
+      echo "  (need root for the namespace? re-run with --capture-sudo)" >&2
+    fi
+    read -r -p "Interface to capture: " iface
+    iface="$(echo "$iface" | tr -d '[:space:]')"
+  fi
+  if [[ -z "$iface" ]]; then
+    echo "No interface selected." >&2
+    exit 1
+  fi
+
+  # Build the remote tcpdump: -U (unbuffered) -nn (no name resolution) -w - (pcap
+  # to stdout). CAP_PRIV supplies root (sudo) when needed. Any BPF filter is
+  # appended as a trailing expression.
+  local if_q remote
+  if_q="$(printf '%q' "$iface")"
+  remote="${CAP_PRIV}ip netns exec ${cap_ns_q} tcpdump -U -nni ${if_q} -w -"
+  if [[ -n "$CAPTURE_FILTER" ]]; then
+    remote="${remote} ${CAPTURE_FILTER}"
+  fi
+
+  echo
+  echo "Capturing ${cap_short} ${iface} on ${CLAB_HOST} → local Wireshark"
+  echo "(no packets are re-transmitted; the pcap stream rides the SSH tunnel)"
+  echo "Close Wireshark to stop the capture."
+
+  # tcpdump writes libpcap to stdout over SSH; Wireshark reads it from stdin.
+  # When interactive sudo is used, feed its password on stdin (never argv).
+  if [[ -n "$CAP_SUDO_PW" ]]; then
+    printf '%s\n' "$CAP_SUDO_PW" \
+      | ssh "${CAP_SSH_OPTS[@]}" "$JUMP_TARGET" "$remote" \
+      | "$WIRESHARK_BIN" -k -i - &
+  else
+    ssh "${CAP_SSH_OPTS[@]}" "$JUMP_TARGET" "$remote" \
+      | "$WIRESHARK_BIN" -k -i - &
+  fi
+  local pid=$!
+  disown "$pid" 2>/dev/null || true
+  CAP_SUDO_PW=""
+  sleep 1.0
+  echo "Wireshark launched (pipeline pid $pid)."
+}
+
+open_url() {
+  local u="$1"
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$u" >/dev/null 2>&1 &
+  elif command -v open >/dev/null 2>&1; then
+    open "$u" >/dev/null 2>&1 &
+  elif command -v wslview >/dev/null 2>&1; then
+    wslview "$u" >/dev/null 2>&1 &
+  elif command -v explorer.exe >/dev/null 2>&1; then
+    explorer.exe "$u" >/dev/null 2>&1 &
+  else
+    echo "Open this URL in your browser: $u"
+    return 0
+  fi
+  disown 2>/dev/null || true
+}
+
+# Edgeshark provides a web UI + Wireshark plugin backend on the clab host (port
+# 5001, no auth). Rather than expose that port to the network, we forward it
+# through the already-authenticated jump tunnel so the local cshargextcap plugin
+# / packetflix:// handler can safely target localhost.
+# Probe an HTTP endpoint; success = the server answered *anything* (any status),
+# not just 2xx (Edgeshark's root may redirect). $2 = attempts, ~2s apart.
+edgeshark_up() {
+  local u="$1" tries="${2:-1}" i
+  command -v curl >/dev/null 2>&1 || return 0
+  for ((i = 1; i <= tries; i++)); do
+    if curl -s -o /dev/null --max-time 4 "$u"; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# Deploy Edgeshark on the clab host via its official Docker Compose file. This
+# is version-independent (older/newer containerlab may lack 'tools edgeshark').
+edgeshark_install() {
+  local compose_url="https://github.com/siemens/edgeshark/raw/main/deployments/wget/docker-compose.yaml"
+
+  echo "Deploying Edgeshark on ${CLAB_HOST} via Docker Compose..."
+  determine_priv_for "docker info" "docker"
+
+  local ssh_opts=(-o StrictHostKeyChecking=accept-new)
+  if [[ -n "$CONTROL_PATH" && -S "$CONTROL_PATH" ]]; then
+    ssh_opts+=(-o "ControlPath=${CONTROL_PATH}" -o ControlMaster=no)
+  fi
+
+  # Fetch the compose file on the host, then bring the stack up detached. Only
+  # the 'docker compose' call is privileged (CAP_PRIV); fetch/rm are not.
+  local remote
+  remote="f=\$(mktemp) && { curl -fsSL '${compose_url}' -o \"\$f\" || wget -qO \"\$f\" '${compose_url}'; } && DOCKER_DEFAULT_PLATFORM= ${CAP_PRIV}docker compose -f \"\$f\" up -d; rc=\$?; rm -f \"\$f\"; exit \$rc"
+
+  if [[ -n "$CAP_SUDO_PW" ]]; then
+    printf '%s\n' "$CAP_SUDO_PW" | ssh "${ssh_opts[@]}" "$JUMP_TARGET" "$remote"
+  else
+    ssh "${ssh_opts[@]}" "$JUMP_TARGET" "$remote" </dev/null
+  fi
+  local rc=$?
+  CAP_SUDO_PW=""
+  if [[ $rc -ne 0 ]]; then
+    echo "Edgeshark deploy failed (exit $rc)." >&2
+    echo "Deploy manually on ${CLAB_HOST}:" >&2
+    echo "  curl -fsSL ${compose_url} | DOCKER_DEFAULT_PLATFORM= docker compose -f - up -d" >&2
+    return 1
+  fi
+  echo "Edgeshark stack requested; waiting for it to come up..."
+  return 0
+}
+
+# cshargextcap must live in a directory Wireshark scans for extcap plugins.
+# Several distro packages install it to /usr/lib/<triplet>/wireshark/extcap, which
+# Wireshark 4.6+ no longer scans, so the 'packetflix'/'mobyshark' interfaces never
+# load. Wireshark then exits *instantly* when the packetflix:// handler passes
+# `-o extcap.packetflix.url:...` ("unknown preference"), which looks like the
+# capture window dying the moment it opens. Detect this and link the plugin into a
+# directory Wireshark actually scans (personal dir first, no root; global as fallback).
+check_extcap_plugin() {
+  local have_tshark=0
+  command -v tshark >/dev/null 2>&1 && have_tshark=1
+
+  # Ground truth: if Wireshark already discovers packetflix, there's nothing to do.
+  if [[ $have_tshark -eq 1 ]] && tshark -D 2>/dev/null | grep -qi 'packetflix'; then
+    return 0
+  fi
+
+  # Locate the installed plugin binary in the common (mis)placed locations.
+  local plug="" c
+  for c in /usr/lib/*/wireshark/extcap/cshargextcap \
+    /usr/lib/wireshark/extcap/cshargextcap \
+    /usr/local/lib/*/wireshark/extcap/cshargextcap \
+    /usr/local/lib/wireshark/extcap/cshargextcap; do
+    [[ -x "$c" ]] && {
+      plug="$c"
+      break
+    }
+  done
+  if [[ -z "$plug" ]]; then
+    echo "Note: the cshargextcap Wireshark plugin isn't installed locally, so the" >&2
+    echo "      Edgeshark 'Wireshark' button won't work. Install it from:" >&2
+    echo "      https://github.com/siemens/cshargextcap/releases" >&2
+    return 0
+  fi
+
+  local personal="$HOME/.local/lib/wireshark/extcap"
+  echo "Wireshark isn't loading cshargextcap (it's in ${plug%/*}, which recent" >&2
+  echo "Wireshark versions don't scan). Linking it into ${personal}..." >&2
+  if mkdir -p "$personal" 2>/dev/null && ln -sf "$plug" "$personal/cshargextcap" 2>/dev/null; then
+    if [[ $have_tshark -eq 1 ]]; then
+      if tshark -D 2>/dev/null | grep -qi 'packetflix'; then
+        echo "Fixed: Wireshark now sees the 'packetflix' capture interface." >&2
+        return 0
+      fi
+      # Confirmed this build doesn't scan the personal dir; don't leave a dead link.
+      rm -f "$personal/cshargextcap" 2>/dev/null
+    else
+      echo "Linked (best effort). Install 'tshark' to auto-verify, or check manually." >&2
+    fi
+  fi
+
+  cat >&2 <<EOF
+If the Wireshark button still dies on open, link the plugin into the global
+extcap directory Wireshark scans (one-time, needs sudo):
+
+  sudo ln -sf ${plug} /usr/libexec/wireshark/extcap/cshargextcap
+
+Verify with:  tshark -D | grep packetflix
+EOF
+  return 0
+}
+
+launch_edgeshark() {
+  need ssh
+  local rport="${EDGESHARK_PORT:-5001}"
+  local lport="${EDGESHARK_LOCAL_PORT:-$rport}"
+
+  local ssh_opts=(-o StrictHostKeyChecking=accept-new)
+  if [[ -n "$CONTROL_PATH" && -S "$CONTROL_PATH" ]]; then
+    ssh_opts+=(-o "ControlPath=${CONTROL_PATH}" -o ControlMaster=no)
+  fi
+
+  local installed=0
+  if [[ "$EDGESHARK_INSTALL" -eq 1 ]]; then
+    edgeshark_install && installed=1
+  fi
+
+  local tries=2
+  [[ "$installed" -eq 1 ]] && tries=15
+
+  local direct_url="http://${CLAB_HOST}:${rport}"
+  local url=""
+
+  # Prefer a DIRECT connection to the host's Edgeshark port. It's simpler and,
+  # crucially, the packetflix capture stream then works without depending on an
+  # SSH port-forward carrying a WebSocket (which is where captures tend to die).
+  # Only tunnel when the host port isn't directly reachable (or forced).
+  if [[ "$EDGESHARK_TUNNEL" -ne 1 ]]; then
+    if [[ "$EDGESHARK_DIRECT" -eq 1 ]] || [[ "$NO_JUMP" -eq 1 ]]; then
+      url="$direct_url"
+      echo "Direct mode: targeting ${url}."
+    elif edgeshark_up "$direct_url" "$tries"; then
+      url="$direct_url"
+      echo "Edgeshark reachable directly at ${url} (no tunnel needed)."
+    fi
+  fi
+
+  # Fall back to forwarding the port through the jump tunnel.
+  if [[ -z "$url" ]]; then
+    if [[ "$NO_JUMP" -eq 1 || -z "$CONTROL_PATH" || ! -S "$CONTROL_PATH" ]]; then
+      echo "Edgeshark is not reachable at ${direct_url} and no jump tunnel is available." >&2
+      echo "Deploy it (--edgeshark-install) or check the host/port." >&2
+      exit 1
+    fi
+    echo "Host port not directly reachable; forwarding through the jump tunnel."
+    if ! python3 -c 'import socket,sys
+s=socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1]))); s.close()
+except OSError:
+    sys.exit(1)' "$lport" 2>/dev/null; then
+      lport="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+    fi
+    # Prefer a multiplexed session over the master (rides the existing auth) and
+    # fall back to `-O forward` if that fails.
+    if ! ssh -fN -o ControlMaster=no -S "$CONTROL_PATH" \
+      -L "127.0.0.1:${lport}:127.0.0.1:${rport}" "$JUMP_TARGET" 2>/dev/null \
+      && ! ssh -S "$CONTROL_PATH" -O forward \
+        -L "127.0.0.1:${lport}:127.0.0.1:${rport}" "$JUMP_TARGET" 2>/dev/null; then
+      echo "Could not set up the Edgeshark port-forward on the jump tunnel." >&2
+      exit 1
+    fi
+    url="http://127.0.0.1:${lport}"
+    echo "Edgeshark tunneled: ${url}  →  ${CLAB_HOST}:${rport} (via ${JUMP_TARGET})"
+    if edgeshark_up "$url" "$tries"; then
+      echo "Edgeshark UI is responding through the tunnel."
+    else
+      echo "Warning: no response from ${url} yet (it may still be starting)." >&2
+    fi
+  fi
+
+  # Make sure the local Wireshark can actually see the packetflix/mobyshark
+  # extcap before we point the user at the capture buttons.
+  check_extcap_plugin
+
+  if [[ "$EDGESHARK_NO_OPEN" -eq 0 ]]; then
+    open_url "$url"
+  fi
+
+  local host_for_plugin="${url#http://}"
+  cat <<EOF
+
+Next steps:
+  • In the Edgeshark web UI, find your node and click its Wireshark button, or
+  • In Wireshark: 'Docker host capture' extcap → gear → Docker host URL: ${host_for_plugin}
+  • One-time local setup (if not done): install the cshargextcap plugin +
+    packetflix:// handler → https://github.com/siemens/cshargextcap/releases
+    (verify Wireshark sees it with:  tshark -D | grep packetflix)
+
+The forwarded port stays up with the jump tunnel and closes when it does.
+EOF
+}
+
 echo "Launcher: ${LAUNCHER}"
 echo "Device user: ${CLAB_USER}"
 if [[ "$NO_JUMP" -eq 0 ]]; then
@@ -795,9 +1264,11 @@ case "$LAUNCHER" in
   wt) launch_native 1 ;;
   powershell) launch_windows_shell powershell ;;
   cmd) launch_windows_shell cmd ;;
+  wireshark|pcap) launch_wireshark ;;
+  edgeshark) launch_edgeshark ;;
   *)
     echo "Unknown launcher: $LAUNCHER" >&2
-    echo "Use: asbru|securecrt|putty|native|wt|powershell|cmd" >&2
+    echo "Use: asbru|securecrt|putty|native|wt|powershell|cmd|wireshark|edgeshark" >&2
     echo "See: ./clab-ssh --list-launchers" >&2
     exit 1
     ;;

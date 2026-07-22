@@ -134,6 +134,36 @@ def probe() -> list[dict[str, str]]:
         }
     )
 
+    wireshark = find_first(
+        [
+            "wireshark",
+            "/Applications/Wireshark.app/Contents/MacOS/Wireshark",
+            "/mnt/c/Program Files/Wireshark/wireshark.exe",
+            "/mnt/c/Program Files (x86)/Wireshark/wireshark.exe",
+            "wireshark.exe",
+            r"C:\Program Files\Wireshark\wireshark.exe",
+        ]
+    )
+    rows.append(
+        {
+            "name": "wireshark",
+            "available": "yes" if wireshark else "no",
+            "path": wireshark or "",
+            "platforms": "All (remote tcpdump piped to local Wireshark)",
+            "jump": "reuses jump tunnel (capture runs on clab host)",
+        }
+    )
+
+    rows.append(
+        {
+            "name": "edgeshark",
+            "available": "yes" if ssh else "no",
+            "path": "service on clab host (port 5001)",
+            "platforms": "All (needs cshargextcap plugin locally)",
+            "jump": "forwards Edgeshark UI through the jump tunnel",
+        }
+    )
+
     return rows
 
 

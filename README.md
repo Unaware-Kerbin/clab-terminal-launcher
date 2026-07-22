@@ -16,6 +16,7 @@ The lab host is never hardcoded — you enter it once and it's saved locally. Ju
 - `clab` on the lab host
 - Whichever terminal app you launch (see the matrix below)
 - Optional: `sshpass` for device-password autofill with the `native` launcher; PuTTY 0.77+ for PuTTY autofill
+- Optional (packet capture): Wireshark locally + `tcpdump` on the lab host
 
 ## Quick start
 
@@ -48,6 +49,8 @@ Any launcher can be selected on any OS with `-t NAME` / `-Launcher NAME` (or `CL
 | Windows Terminal | `wt` | WSL | — | ✓ | ✓ | `ssh -J` |
 | PowerShell | `powershell` | `pwsh` | `pwsh` | ✓ | ✓ | `ssh -J` |
 | cmd.exe | `cmd` | — | — | ✓ | ✓ | `ssh -J` |
+| Wireshark capture | `wireshark` | ✓ | ✓ | ✓ | ✓ | reuses the jump tunnel |
+| Edgeshark UI | `edgeshark` | ✓ | ✓ | ✓ | ✓ | forwards the UI through the jump |
 
 **Defaults:** Linux → `asbru` if installed, else `native`; macOS → `native`; Windows → `securecrt` → `putty` → `native`.
 
@@ -69,6 +72,52 @@ All sessions tunnel through `user@<lab-host>`. The jump password is entered once
 .\clab-ssh.ps1 -Launcher securecrt -JumpSession "CLAB-Host"
 .\clab-ssh.ps1 -HostAddress lab.example.com
 ```
+
+## Packet capture (Wireshark)
+
+`-t wireshark` runs `tcpdump` inside a node's network namespace **on the lab host** and pipes the raw pcap stream back over the existing SSH jump tunnel into your local Wireshark. No packets are re-transmitted onto the wire — Wireshark on your PC simply reads `tcpdump`'s standard output:
+
+```
+ssh user@lab-host "ip netns exec <node> tcpdump -U -nni <iface> -w -" | wireshark -k -i -
+```
+
+You pick a node, then an interface (auto-listed from the node), and Wireshark opens live. Close Wireshark to stop the capture.
+
+```bash
+./clab-ssh -t wireshark pe-1                       # pick interface interactively
+./clab-ssh -t wireshark pe-1 --capture-iface e1-1  # capture a specific interface
+./clab-ssh -t wireshark pe-1 --capture-iface e1-1 --capture-filter 'tcp port 179'
+./clab-ssh -t wireshark pe-1 --capture-sudo        # if the host needs sudo for netns
+```
+
+```powershell
+.\clab-ssh.ps1 -Launcher wireshark -Nodes pe-1 -CaptureIface e1-1
+.\clab-ssh.ps1 -Launcher wireshark -Nodes pe-1 -CaptureSudo
+```
+
+Notes:
+- `tcpdump` must be installed on the lab host; Wireshark must be installed locally (set `WIRESHARK_BIN` / `-WiresharkBin` if it's not on `PATH` — e.g. the `.app` binary on macOS or `wireshark.exe` on Windows).
+- Entering a node namespace needs root. The tool auto-detects this (direct → passwordless `sudo -n` → prompt); `--capture-sudo` forces the prompt. The sudo password is fed over stdin, never on the command line.
+- Interface names are node-specific (`e1-1` on SR Linux, `eth1` on Linux/vrnetlab/vJunos nodes). The tool always lists the namespace's real interfaces and validates `--capture-iface` against them, so a wrong name shows the choices instead of failing in Wireshark.
+
+### Edgeshark
+
+If you already run [Edgeshark](https://github.com/siemens/edgeshark) on the lab host (a web UI + `cshargextcap` Wireshark plugin), `-t edgeshark` **forwards its port through the jump tunnel** so your local plugin / `packetflix://` handler can target `localhost` — you get Edgeshark's point-and-click capture without exposing its unauthenticated port to the network.
+
+```bash
+./clab-ssh -t edgeshark                    # tunnel + open the UI at http://127.0.0.1:5001
+./clab-ssh -t edgeshark --edgeshark-install # deploy Edgeshark on the host first
+./clab-ssh -t edgeshark --no-open           # just set up the tunnel
+```
+
+```powershell
+.\clab-ssh.ps1 -Launcher edgeshark
+.\clab-ssh.ps1 -Launcher edgeshark -EdgesharkInstall
+```
+
+The one-time local step is installing the [`cshargextcap`](https://github.com/siemens/cshargextcap/releases) plugin (and the `packetflix://` handler). On Linux the forward is added to the existing jump tunnel with no extra password; on Windows a dedicated forwarding SSH window is opened.
+
+> **If the Wireshark capture window dies the instant it opens:** the `cshargextcap` package often installs into `/usr/lib/<arch>/wireshark/extcap/`, but Wireshark 4.6+ only scans `/usr/libexec/wireshark/extcap/` (and your personal extcap dir). When the plugin isn't loaded, the `packetflix://` handler passes an unknown `extcap.packetflix.url` preference and Wireshark exits immediately. `-t edgeshark` now auto-detects this and links the plugin into `~/.local/lib/wireshark/extcap/`; if your build doesn't scan that, run the printed one-time command: `sudo ln -sf /usr/lib/*/wireshark/extcap/cshargextcap /usr/libexec/wireshark/extcap/cshargextcap`. Verify with `tshark -D | grep packetflix`.
 
 ## Device password autofill
 
@@ -126,6 +175,14 @@ Set `CLAB_SSH_CONFIG` to relocate the config file (the vault stays a sibling nam
 | `--save-device-creds` / `-SaveDeviceCreds` | Create/update the vault | |
 | `--forget-device-creds` / `-ForgetDeviceCreds` | Delete the vault | |
 | `--no-device-creds` / `-NoDeviceCreds` | Skip the vault this run | |
+| `--capture-iface` / `-CaptureIface` / `CAPTURE_IFACE` | Node interface to capture (`wireshark`) | prompted |
+| `--capture-filter` / `-CaptureFilter` / `CAPTURE_FILTER` | tcpdump/BPF filter (`wireshark`) | none |
+| `--capture-sudo` / `-CaptureSudo` | Use sudo for `ip netns exec` (`wireshark`) | auto-detect |
+| `--wireshark` / `-WiresharkBin` / `WIRESHARK_BIN` | Local Wireshark binary | auto |
+| `--edgeshark-install` / `-EdgesharkInstall` | Deploy Edgeshark on the host (`edgeshark`) | off |
+| `--edgeshark-port` / `-EdgesharkPort` / `EDGESHARK_PORT` | Edgeshark port on the host | `5001` |
+| `--edgeshark-local-port` / `-EdgesharkLocalPort` | Local tunnel port (`edgeshark`) | same, else auto |
+| `--no-open` / `-NoOpen` | Don't auto-open the browser (`edgeshark`) | off |
 | `CLAB_SSH_CONFIG` | Override the settings file path | `~/.config/clab-ssh/config` |
 | `ASBRU_BIN` / `ASBRU_CFG_DIR` | Ásbrú binary / config dir | auto / `~/asbru-clab` |
 | `SECURECRT_BIN` / `SECURECRT_JUMP_SESSION` | SecureCRT path / jump session | |

@@ -27,6 +27,14 @@ param(
   [string]$SecureCrtBin = $(if ($env:SECURECRT_BIN) { $env:SECURECRT_BIN } else { "" }),
   [string]$PuttyBin = $(if ($env:PUTTY_BIN) { $env:PUTTY_BIN } else { "" }),
   [string]$JumpSession = "",
+  [string]$WiresharkBin = $(if ($env:WIRESHARK_BIN) { $env:WIRESHARK_BIN } else { "" }),
+  [string]$CaptureIface = $(if ($env:CAPTURE_IFACE) { $env:CAPTURE_IFACE } else { "" }),
+  [string]$CaptureFilter = $(if ($env:CAPTURE_FILTER) { $env:CAPTURE_FILTER } else { "" }),
+  [switch]$CaptureSudo,
+  [int]$EdgesharkPort = $(if ($env:EDGESHARK_PORT) { [int]$env:EDGESHARK_PORT } else { 5001 }),
+  [int]$EdgesharkLocalPort = 0,
+  [switch]$EdgesharkInstall,
+  [switch]$NoOpen,
   [string[]]$Nodes = @()
 )
 
@@ -214,6 +222,22 @@ function Get-PuttyPath {
     if ($cmd) { return $cmd.Source }
   }
   throw "PuTTY not found. Set PUTTY_BIN or -PuttyBin."
+}
+
+function Get-WiresharkPath {
+  if ($WiresharkBin) { return $WiresharkBin }
+  $candidates = @(
+    "${env:ProgramFiles}\Wireshark\wireshark.exe",
+    "${env:ProgramFiles(x86)}\Wireshark\wireshark.exe",
+    "wireshark.exe",
+    "wireshark"
+  )
+  foreach ($c in $candidates) {
+    if (Test-Path $c) { return $c }
+    $cmd = Get-Command $c -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+  }
+  throw "Wireshark not found. Set WIRESHARK_BIN or -WiresharkBin."
 }
 
 function Get-DefaultLauncher {
@@ -479,7 +503,118 @@ switch ($Launcher) {
     Write-Host "Launched $($devices.Count) cmd session(s)."
   }
 
+  { $_ -in @("wireshark", "pcap") } {
+    $ws = Get-WiresharkPath
+    $sshTarget = "${SshUser}@${HostAddress}"
+
+    # Pick the node (netns = container long name).
+    if ($devices.Count -eq 1) {
+      $capNode = $devices[0]
+    } else {
+      Write-Host "Select a node to capture:"
+      for ($i = 0; $i -lt $devices.Count; $i++) {
+        "{0,3}) {1,-16} {2}" -f ($i + 1), $devices[$i].short, $devices[$i].long
+      }
+      $sel = Read-Host "Node number [1]"
+      if ([string]::IsNullOrWhiteSpace($sel)) { $sel = "1" }
+      if ($sel -notmatch '^\d+$' -or [int]$sel -lt 1 -or [int]$sel -gt $devices.Count) {
+        throw "Invalid selection."
+      }
+      $capNode = $devices[[int]$sel - 1]
+    }
+    $capLong = $capNode.long
+
+    # The clab node namespaces live on the clab host; capture always targets it.
+    $sudoPrefix = if ($CaptureSudo) { "sudo -S -p '' " } else { "" }
+
+    $iface = $CaptureIface
+    if (-not $iface) {
+      Write-Host "Listing interfaces on $($capNode.short) ($capLong)..."
+      $listRemote = "${sudoPrefix}ip netns exec $capLong ip -br link"
+      try {
+        $lines = & ssh -o StrictHostKeyChecking=accept-new $sshTarget $listRemote 2>$null
+        foreach ($ln in $lines) {
+          $name = ($ln -split '\s+')[0] -replace '@.*$', ''
+          if ($name) { Write-Host "   - $name" }
+        }
+      } catch {
+        Write-Host "   (could not list interfaces — sudo may be required: -CaptureSudo)" -ForegroundColor Yellow
+      }
+      $iface = (Read-Host "Interface to capture").Trim()
+    }
+    if (-not $iface) { throw "No interface selected." }
+
+    $remote = "${sudoPrefix}ip netns exec $capLong tcpdump -U -nni $iface -w -"
+    if ($CaptureFilter) { $remote = "$remote $CaptureFilter" }
+
+    Write-Host ""
+    Write-Host "Capturing $($capNode.short) $iface on $HostAddress → local Wireshark"
+    Write-Host "(no packets are re-transmitted; the pcap stream rides the SSH tunnel)"
+    Write-Host "Close Wireshark to stop the capture."
+
+    # PowerShell's pipeline mangles binary, so run the tcpdump|wireshark pipe
+    # inside cmd.exe which passes the raw pcap stream through untouched.
+    $pipe = "ssh -o StrictHostKeyChecking=accept-new $sshTarget `"$remote`" | `"$ws`" -k -i -"
+    if ($CaptureSudo) {
+      $sudoPw = Read-Host "sudo password for $sshTarget" -AsSecureString
+      $pwText = Get-SecureStringText $sudoPw
+      $pwFile = [System.IO.Path]::GetTempFileName()
+      Set-Content -Path $pwFile -Value $pwText -NoNewline -Encoding ASCII
+      $pipe = "type `"$pwFile`" | " + $pipe
+      Start-Job -ScriptBlock {
+        param($p) Start-Sleep -Seconds 15; Remove-Item $p -Force -ErrorAction SilentlyContinue
+      } -ArgumentList $pwFile | Out-Null
+      $pwText = $null
+    }
+    Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$pipe`""
+    Write-Host "Wireshark launched."
+  }
+
+  "edgeshark" {
+    $rport = $EdgesharkPort
+    $lport = if ($EdgesharkLocalPort -gt 0) { $EdgesharkLocalPort } else { $rport }
+    $sshTarget = "${SshUser}@${HostAddress}"
+
+    if ($EdgesharkInstall) {
+      Write-Host "Deploying Edgeshark on $HostAddress via Docker Compose..."
+      $composeUrl = "https://github.com/siemens/edgeshark/raw/main/deployments/wget/docker-compose.yaml"
+      $remote = 'f=$(mktemp) && { curl -fsSL "URL" -o "$f" || wget -qO "$f" "URL"; } && DOCKER_DEFAULT_PLATFORM= docker compose -f "$f" up -d; rc=$?; rm -f "$f"; exit $rc'
+      $remote = $remote.Replace("URL", $composeUrl)
+      & ssh -o StrictHostKeyChecking=accept-new $sshTarget $remote
+      if ($LASTEXITCODE -ne 0) {
+        Write-Host "Edgeshark deploy failed. Deploy manually:" -ForegroundColor Yellow
+        Write-Host "  curl -fsSL $composeUrl | DOCKER_DEFAULT_PLATFORM= docker compose -f - up -d" -ForegroundColor Yellow
+      }
+    }
+
+    if ($NoJump) {
+      $url = "http://${HostAddress}:$rport"
+      Write-Host "Direct mode: targeting $url (no tunnel)."
+    } else {
+      # No shared control master on Windows, so open a dedicated forwarding SSH
+      # (it prompts for the host password once and stays open in its own window).
+      Write-Host "Opening SSH port-forward 127.0.0.1:$lport → ${HostAddress}:$rport ..."
+      Start-Process -FilePath "ssh" -ArgumentList @(
+        "-N", "-L", "127.0.0.1:${lport}:127.0.0.1:${rport}",
+        "-o", "StrictHostKeyChecking=accept-new", $sshTarget
+      )
+      Start-Sleep -Seconds 2
+      $url = "http://127.0.0.1:$lport"
+      Write-Host "Edgeshark tunneled: $url → ${HostAddress}:$rport"
+    }
+
+    if (-not $NoOpen) { Start-Process $url }
+
+    $hostForPlugin = $url -replace '^http://', ''
+    Write-Host ""
+    Write-Host "Next steps:"
+    Write-Host "  * In the Edgeshark web UI, click a node's Wireshark button, or"
+    Write-Host "  * Wireshark 'Docker host capture' extcap -> Docker host URL: $hostForPlugin"
+    Write-Host "  * One-time: install cshargextcap -> https://github.com/siemens/cshargextcap/releases"
+    Write-Host "The forward stays open until you close its SSH window."
+  }
+
   default {
-    throw "Unknown launcher: $Launcher (use asbru|securecrt|putty|native|wt|powershell|cmd). Try -ListLaunchers."
+    throw "Unknown launcher: $Launcher (use asbru|securecrt|putty|native|wt|powershell|cmd|wireshark|edgeshark). Try -ListLaunchers."
   }
 }
