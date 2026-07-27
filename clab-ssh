@@ -238,8 +238,26 @@ open_jump_master() {
   touch "$known_hosts"
   chmod 600 "$known_hosts" 2>/dev/null || true
 
+  # Reuse an already-open master if one is alive, so concurrent clab-ssh runs
+  # (e.g. a Wireshark capture AND a terminal session) share a single tunnel
+  # instead of tearing each other's down. The SOCKS port is stashed alongside
+  # the socket so a reusing run can still hand it to Ásbrú.
+  local socks_file="${cm_dir}/socks_port"
+  if ssh -O check -S "$CONTROL_PATH" "$JUMP_TARGET" >/dev/null 2>&1; then
+    local saved_port=""
+    [[ -f "$socks_file" ]] && saved_port="$(cat "$socks_file" 2>/dev/null)"
+    if [[ -n "$saved_port" ]]; then
+      SOCKS_PORT="$saved_port"
+      echo "Reusing existing jump tunnel (SOCKS 127.0.0.1:${SOCKS_PORT}); no password needed."
+      return 0
+    fi
+    # Live master but unknown SOCKS port (pre-existing/old tunnel): refresh it
+    # so we have a port to advertise. Rare and one-time.
+    echo "Existing jump tunnel found without a known SOCKS port; refreshing it."
+  fi
+
   ssh -O exit -S "$CONTROL_PATH" "$JUMP_TARGET" >/dev/null 2>&1 || true
-  rm -f "$CONTROL_PATH"
+  rm -f "$CONTROL_PATH" "$socks_file"
 
   SOCKS_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
 
@@ -280,6 +298,9 @@ ASK
   unset CLAB_JUMP_PASSWORD SSH_ASKPASS SSH_ASKPASS_REQUIRE
   rm -f "$askpass"
   jump_password=""
+  # Record the SOCKS port so later concurrent runs can reuse this master.
+  printf '%s\n' "$SOCKS_PORT" >"$socks_file" 2>/dev/null || true
+  chmod 600 "$socks_file" 2>/dev/null || true
   echo "Jump tunnel ready (SOCKS 127.0.0.1:${SOCKS_PORT})."
 }
 

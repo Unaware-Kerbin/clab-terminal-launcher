@@ -99,6 +99,7 @@ Notes:
 - `tcpdump` must be installed on the lab host; Wireshark must be installed locally (set `WIRESHARK_BIN` / `-WiresharkBin` if it's not on `PATH` — e.g. the `.app` binary on macOS or `wireshark.exe` on Windows).
 - Entering a node namespace needs root. The tool auto-detects this (direct → passwordless `sudo -n` → prompt); `--capture-sudo` forces the prompt. The sudo password is fed over stdin, never on the command line.
 - Interface names are node-specific (`e1-1` on SR Linux, `eth1` on Linux/vrnetlab/vJunos nodes). The tool always lists the namespace's real interfaces and validates `--capture-iface` against them, so a wrong name shows the choices instead of failing in Wireshark.
+- A capture and a terminal session can run at the same time: concurrent `clab-ssh` runs reuse the one live jump tunnel instead of tearing each other's down, so starting a session no longer kills an in-progress capture (and the second run doesn't re-prompt for the jump password).
 
 ### Edgeshark
 
