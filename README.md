@@ -12,7 +12,7 @@ The lab host is never hardcoded — you enter it once and it's saved locally. Ju
 ## Requirements
 
 - OpenSSH client (`ssh`)
-- Python 3 — plus `pyyaml` and `cryptography` for the encrypted vault / Ásbrú (`pip install pyyaml cryptography`)
+- Python 3 — plus `PyYAML` and `cryptography` for the encrypted vault / Ásbrú (`pip install -r requirements.txt`)
 - `clab` on the lab host
 - Whichever terminal app you launch (see the matrix below)
 - Optional: `sshpass` for device-password autofill with the `native` launcher; PuTTY 0.77+ for PuTTY autofill

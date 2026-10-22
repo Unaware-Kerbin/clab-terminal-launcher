@@ -47,7 +47,7 @@ def _need_cryptography():
     except ImportError as exc:
         raise SystemExit(
             "cryptography is required for the credential vault.\n"
-            "Install with: pip install cryptography"
+            "Install with: pip install -r requirements.txt"
         ) from exc
     return Fernet, InvalidToken, hashes, PBKDF2HMAC
 
