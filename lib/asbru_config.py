@@ -53,7 +53,7 @@ def asbru_encrypt_hex(plaintext: str) -> str:
     except ImportError as exc:
         raise SystemExit(
             "cryptography is required to encode Ásbrú passwords.\n"
-            "Install with: pip install cryptography"
+            "Install with: pip install -r requirements.txt"
         ) from exc
 
     raw = plaintext.encode("utf-8")
@@ -81,7 +81,10 @@ def write_asbru_config(
     try:
         import yaml
     except ImportError as exc:
-        raise SystemExit("python3-yaml (PyYAML) is required to write Ásbrú config") from exc
+        raise SystemExit(
+            "python3-yaml (PyYAML) is required to write Ásbrú config.\n"
+            "Install with: pip install -r requirements.txt"
+        ) from exc
 
     cfg_dir = cfg_dir.expanduser().resolve()
     cfg_dir.mkdir(parents=True, exist_ok=True)
