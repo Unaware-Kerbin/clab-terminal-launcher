@@ -13,7 +13,7 @@ The lab host is never hardcoded — you enter it once and it's saved locally. Ju
 
 - OpenSSH client (`ssh`)
 - Python 3 — plus `cryptography` for the encrypted vault (`pip install -r requirements.txt`)
-- [Late](https://github.com/unaware-kerbin/late) open on this computer for the `late` launcher (the tabbed sessions). Ásbrú is not used.
+- [Late](https://github.com/unaware-kerbin/late) open on this computer for the `late` launcher. It files the nodes in a `clab-<lab-host>` folder and opens one SSH tab each.
 - `clab` on the lab host
 - Whichever terminal app you launch (see the matrix below)
 - Optional: `sshpass` for device-password autofill with the `native` launcher; PuTTY 0.77+ for PuTTY autofill
@@ -43,7 +43,7 @@ Any launcher can be selected on any OS with `-t NAME` / `-Launcher NAME` (or `CL
 
 | Launcher | Name | Linux | macOS | Windows | WSL | Jump without a saved session |
 |---|---|:--:|:--:|:--:|:--:|---|
-| Late | `late` | ✓ | ✓ | ✓ | ✓ | SOCKS tunnel into Late (else OpenSSH `-J`) |
+| Late | `late` | ✓ | ✓ | ✓ | ✓ | Linux/macOS: jump SOCKS (keep the tunnel up). Windows: OpenSSH `-J` inside Late |
 | SecureCRT | `securecrt` | ✓ | ✓ | ✓ | ✓ | falls back to OpenSSH `-J` |
 | PuTTY | `putty` | ✓ | rare | ✓ | ✓ | `-proxycmd` + OpenSSH |
 | Native OpenSSH | `native` | ✓ | ✓ | ✓ | ✓ | `ssh -J` |
@@ -53,13 +53,13 @@ Any launcher can be selected on any OS with `-t NAME` / `-Launcher NAME` (or `CL
 | Wireshark capture | `wireshark` | ✓ | ✓ | ✓ | ✓ | reuses the jump tunnel |
 | Edgeshark UI | `edgeshark` | ✓ | ✓ | ✓ | ✓ | forwards the UI through the jump |
 
-**Defaults:** Linux → `late` when Late is already running, else `native`; macOS → `native`; Windows → `securecrt` → `putty` → `native`. `-t asbru` opens Late and tells you Ásbrú is no longer used.
+**Defaults:** Linux → `late` when Late is already running, else `native`; macOS → `native`; Windows → `securecrt` → `putty` → `native`. The old name `-t asbru` opens the same Late sessions.
 
 `native` auto-picks the first terminal it finds (Ptyxis, GNOME Terminal, Konsole, XFCE/MATE, Kitty, Alacritty, `x-terminal-emulator`, iTerm/Terminal.app, or Windows Terminal/PowerShell under WSL). Override the spawn command with `TERMINAL_CMD`.
 
 ## Jump host
 
-All sessions tunnel through `user@<lab-host>`. The jump password is entered once per run; on Linux/macOS the native and PuTTY launchers reuse that single authenticated tunnel for every session.
+All sessions tunnel through `user@<lab-host>`. The jump password is entered once per run. On Linux/macOS, Late, native, and PuTTY reuse that single authenticated tunnel. Late uses its SOCKS port — leave that tunnel up while the Late tabs are open. On Windows, `late` has no shared tunnel: each node opens with OpenSSH `-J`, and you type the passwords in the Late terminal.
 
 ```bash
 ./clab-ssh --no-jump -t native                     # connect directly to mgmt IPs
@@ -143,7 +143,7 @@ Support varies by launcher and is intentionally limited to methods that don't le
 
 | Launcher | Autofill | How |
 |---|---|---|
-| Late | yes | Late's secret store, via the jump tunnel |
+| Late | Linux/macOS tunnel | Late's secret file through the SOCKS jump. Windows, and a later reconnect from Late's device list, prompt in the terminal |
 | native / `wt` (Linux, macOS) | yes | `sshpass -f` (temp file) — requires `sshpass` |
 | PuTTY (native build, incl. Windows) | yes | `-pwfile` (temp file) — requires PuTTY 0.77+ |
 | SecureCRT | no | interactive (its `/PASSWORD` would expose the password in `ps`) |
@@ -151,7 +151,7 @@ Support varies by launcher and is intentionally limited to methods that don't le
 
 Where autofill isn't available you're simply prompted as usual. Temp password files are `600` and shredded seconds after launch.
 
-> **Note:** The vault is the secure store. Late saves the device password in its own `0600` secret file only when you launch with autofill. The jump password is never stored. Old `~/asbru-clab/` files are unused; delete that directory if it is still on disk.
+> **Note:** The vault is the secure store. Late saves the device password in its own `0600` secret file only when you launch with autofill through the Linux/macOS jump tunnel. The jump password is never stored. Leftover `~/asbru-clab/` files from older launches are unused; delete that directory if it is still on disk.
 
 ## Local settings (never in git)
 
