@@ -19,6 +19,26 @@ The lab host is never hardcoded — you enter it once and it's saved locally. Ju
 - Optional: `sshpass` for device-password autofill with the `native` launcher; PuTTY 0.77+ for PuTTY autofill
 - Optional (packet capture): Wireshark locally + `tcpdump` on the lab host
 
+## Install
+
+From this checkout. The `late` launcher opens SSH tabs in [Late](https://github.com/unaware-kerbin/late). Install Late separately and open it before `clab-ssh -t late`. native, PuTTY, SecureCRT, Wireshark, and Edgeshark do not need Late.
+
+```bash
+./install.sh
+clab-ssh --list-launchers
+clab-ssh -t late
+```
+
+`./install.sh` copies the script and `lib/` to `~/.local/share/clab-ssh` and links `~/.local/bin/clab-ssh`. Set `PREFIX` to install somewhere else (`PREFIX=/usr/local sudo ./install.sh`). If `~/.local/bin` is not on `PATH`, the script says so.
+
+```powershell
+.\install.ps1
+clab-ssh.ps1 -ListLaunchers
+clab-ssh.ps1 -Launcher late
+```
+
+`.\install.ps1` copies `clab-ssh.ps1` and `lib\` to `%LOCALAPPDATA%\clab-ssh` and adds that folder to your user PATH. Set `CLAB_SSH_PREFIX` to pick a different folder.
+
 ## Quick start
 
 ```bash
@@ -194,6 +214,8 @@ Set `CLAB_SSH_CONFIG` to relocate the config file (the vault stays a sibling nam
 ## Layout
 
 ```
+install.sh            # Linux/macOS install into ~/.local
+install.ps1           # Windows install into %LOCALAPPDATA%\clab-ssh
 clab-ssh              # bash CLI
 clab-ssh.ps1          # PowerShell CLI
 lib/discover.py       # node discovery
