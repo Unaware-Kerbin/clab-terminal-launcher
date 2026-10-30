@@ -3,7 +3,6 @@
 *.local
 *.vault
 credentials.vault
-asbru-clab/
 
 # Python virtualenvs (embed absolute paths / username — never publish)
 clab/

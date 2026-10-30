@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Open discovered Containerlab nodes as SSH sessions inside Late.
 
-Ásbrú is not used. Late's daemon (127.0.0.1:7420) stages the nodes in a
-folder and opens a terminal for each one. The device password is read from
-CLAB_DEVICE_PASSWORD (never argv) and is not printed.
+Late's daemon (127.0.0.1:7420) stages the nodes in a folder and opens a
+terminal for each one. The device password is read from CLAB_DEVICE_PASSWORD
+(never argv) and is not printed.
 
   python3 lib/late_launch.py probe
   python3 lib/late_launch.py --host 192.0.2.10 --ssh-user lab --devices-json '[...]'
@@ -100,7 +100,7 @@ def open_in_late(params: dict[str, object], timeout: float) -> dict[str, object]
     if not daemon_up(timeout=min(timeout, 2.0)):
         raise SystemExit(
             "Late is not running on this computer.\n"
-            "Start Late, then run this again. Ásbrú is not required."
+            "Start Late, then run this again."
         )
     token = read_token()
     body = json.dumps(build_rpc(params)).encode("utf-8")

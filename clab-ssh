@@ -123,10 +123,6 @@ while [[ $# -gt 0 ]]; do
     --save-device-creds) SAVE_DEVICE_CREDS=1; shift ;;
     --forget-device-creds) FORGET_DEVICE_CREDS=1; shift ;;
     --no-device-creds) NO_DEVICE_CREDS=1; shift ;;
-    --asbru)
-      echo "Ásbrú is no longer used. Sessions open inside Late (-t late)." >&2
-      exit 1
-      ;;
     --securecrt) need_arg "$@"; SECURECRT_BIN="$2"; shift 2 ;;
     --putty) need_arg "$@"; PUTTY_BIN="$2"; shift 2 ;;
     --wireshark) need_arg "$@"; WIRESHARK_BIN="$2"; shift 2 ;;
@@ -347,7 +343,7 @@ detect_default_launcher() {
   uname_s="$(uname -s 2>/dev/null || echo unknown)"
   case "$uname_s" in
     Linux*)
-      # Late replaces Ásbrú as the tabbed connection manager when it is running.
+      # Late is the tabbed connection manager when its daemon is already running.
       if [[ "$(python3 "${LIB_DIR}/late_launch.py" probe 2>/dev/null || true)" == "yes" ]]; then
         echo late
       else
@@ -619,10 +615,6 @@ mk_pw_file() {
 }
 
 launch_late() {
-  if [[ "${1:-}" == "asbru" ]]; then
-    echo "Ásbrú is no longer used. Opening these nodes in Late."
-  fi
-
   load_device_credentials
   local device_user="$DEVICE_USER"
   local device_password="$DEVICE_PASSWORD"
@@ -1234,7 +1226,6 @@ echo
 
 case "$LAUNCHER" in
   late) launch_late ;;
-  asbru) launch_late asbru ;;
   securecrt) launch_securecrt ;;
   putty) launch_putty ;;
   native) launch_native 0 ;;

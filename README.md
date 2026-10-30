@@ -53,7 +53,7 @@ Any launcher can be selected on any OS with `-t NAME` / `-Launcher NAME` (or `CL
 | Wireshark capture | `wireshark` | ✓ | ✓ | ✓ | ✓ | reuses the jump tunnel |
 | Edgeshark UI | `edgeshark` | ✓ | ✓ | ✓ | ✓ | forwards the UI through the jump |
 
-**Defaults:** Linux → `late` when Late is already running, else `native`; macOS → `native`; Windows → `securecrt` → `putty` → `native`. The old name `-t asbru` opens the same Late sessions.
+**Defaults:** Linux → `late` when Late is already running, else `native`; macOS → `native`; Windows → `securecrt` → `putty` → `native`.
 
 `native` auto-picks the first terminal it finds (Ptyxis, GNOME Terminal, Konsole, XFCE/MATE, Kitty, Alacritty, `x-terminal-emulator`, iTerm/Terminal.app, or Windows Terminal/PowerShell under WSL). Override the spawn command with `TERMINAL_CMD`.
 
@@ -151,7 +151,7 @@ Support varies by launcher and is intentionally limited to methods that don't le
 
 Where autofill isn't available you're simply prompted as usual. Temp password files are `600` and shredded seconds after launch.
 
-> **Note:** The vault is the secure store. Late saves the device password in its own `0600` secret file only when you launch with autofill through the Linux/macOS jump tunnel. The jump password is never stored. Leftover `~/asbru-clab/` files from older launches are unused; delete that directory if it is still on disk.
+> **Note:** The vault is the secure store. Late saves the device password in its own `0600` secret file only when you launch with autofill through the Linux/macOS jump tunnel. The jump password is never stored.
 
 ## Local settings (never in git)
 

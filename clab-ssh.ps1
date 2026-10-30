@@ -22,8 +22,6 @@ param(
   [switch]$SaveDeviceCreds,
   [switch]$ForgetDeviceCreds,
   [switch]$NoDeviceCreds,
-  [string]$AsbruBin = $(if ($env:ASBRU_BIN) { $env:ASBRU_BIN } else { "" }),
-  [string]$AsbruCfgDir = $(if ($env:ASBRU_CFG_DIR) { $env:ASBRU_CFG_DIR } else { (Join-Path $HOME "asbru-clab") }),
   [string]$SecureCrtBin = $(if ($env:SECURECRT_BIN) { $env:SECURECRT_BIN } else { "" }),
   [string]$PuttyBin = $(if ($env:PUTTY_BIN) { $env:PUTTY_BIN } else { "" }),
   [string]$JumpSession = "",
@@ -374,10 +372,7 @@ Write-Host "Enter jump-host password when prompted (device password autofills in
 Write-Host ""
 
 switch ($Launcher) {
-  { $_ -in "late", "asbru" } {
-    if ($Launcher -eq "asbru") {
-      Write-Host "Ásbrú is no longer used. Opening these nodes in Late."
-    }
+  "late" {
     $creds = Resolve-DeviceCredentials
     if ($creds.user) { $DeviceUser = $creds.user }
     $devicePassword = $creds.password
