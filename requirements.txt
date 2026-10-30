@@ -1,5 +1,3 @@
 # cryptography>=50.0.0 clears GHSA-g6cj-pr64-35w5 (49.0.0 also clears
-# GHSA-jwv3-5hgf-82ww and GHSA-m2h6-j472-rp4c). PyYAML>=5.4 clears
-# GHSA-8q59-q68h-6hv4.
+# GHSA-jwv3-5hgf-82ww and GHSA-m2h6-j472-rp4c).
 cryptography>=50.0.0
-PyYAML>=5.4
