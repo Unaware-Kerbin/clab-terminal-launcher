@@ -42,7 +42,6 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LibDir = Join-Path $ScriptDir "lib"
 $DiscoverPy = Join-Path $LibDir "discover.py"
-$AsbruPy = Join-Path $LibDir "asbru_config.py"
 $UserConfigPy = Join-Path $LibDir "user_config.py"
 $CredentialsPy = Join-Path $LibDir "credentials.py"
 $HostFromFlag = $PSBoundParameters.ContainsKey("HostAddress")
@@ -371,29 +370,21 @@ function Start-NativeSessions([bool]$ForceWt) {
 Write-Host "Launcher: $Launcher"
 Write-Host "Device user: $DeviceUser"
 if ($NoJump) { Write-Host "Jump host: (none)" } else { Write-Host "Jump host: ${SshUser}@${HostAddress}" }
-Write-Host "Enter jump-host password when prompted (device password autofills for asbru; putty where supported)."
+Write-Host "Enter jump-host password when prompted (device password autofills in Late when a tunnel is up; putty where supported)."
 Write-Host ""
 
 switch ($Launcher) {
-  "asbru" {
+  { $_ -in "late", "asbru" } {
+    if ($Launcher -eq "asbru") {
+      Write-Host "Ásbrú is no longer used. Opening these nodes in Late."
+    }
     $creds = Resolve-DeviceCredentials
     if ($creds.user) { $DeviceUser = $creds.user }
     $devicePassword = $creds.password
-
-    $jumpPassword = ""
-    if (-not $NoJump) {
-      Write-Host "Ásbrú needs the jump-host password once (not stored)."
-      $jp = Read-Host "Password for jump host ${SshUser}@${HostAddress}" -AsSecureString
-      $jumpPassword = Get-SecureStringText $jp
-      if ([string]::IsNullOrEmpty($jumpPassword)) {
-        Write-Host "Jump password empty — device autofill will be disabled to avoid a hang." -ForegroundColor Yellow
-      }
-    }
-
     $devicesJson = ($devices | ConvertTo-Json -Compress -Depth 5)
     if (-not $devicesJson.StartsWith("[")) { $devicesJson = "[$devicesJson]" }
     $aArgs = @(
-      "--cfg-dir", $AsbruCfgDir, "--host", $HostAddress,
+      "--host", $HostAddress,
       "--ssh-user", $SshUser, "--device-user", $DeviceUser,
       "--devices-json", $devicesJson
     )
@@ -403,31 +394,13 @@ switch ($Launcher) {
     } else {
       Remove-Item Env:CLAB_DEVICE_PASSWORD -ErrorAction SilentlyContinue
     }
-    if ($jumpPassword) {
-      $env:CLAB_JUMP_PASSWORD = $jumpPassword
-    } else {
-      Remove-Item Env:CLAB_JUMP_PASSWORD -ErrorAction SilentlyContinue
-    }
     try {
-      $uuids = Invoke-PyScript -Script $AsbruPy -ScriptArgs $aArgs
-      if ($LASTEXITCODE -ne 0) { throw "Failed to write Ásbrú config." }
+      Invoke-PyScript -Script (Join-Path $LibDir "late_launch.py") -ScriptArgs $aArgs
+      if ($LASTEXITCODE -ne 0) { throw "Late did not open the sessions." }
     } finally {
       Remove-Item Env:CLAB_DEVICE_PASSWORD -ErrorAction SilentlyContinue
-      Remove-Item Env:CLAB_JUMP_PASSWORD -ErrorAction SilentlyContinue
       $devicePassword = $null
-      $jumpPassword = $null
     }
-    $bin = if ($AsbruBin) { $AsbruBin } else {
-      $c = Get-Command asbru, asbru-cm -ErrorAction SilentlyContinue | Select-Object -First 1
-      if (-not $c) { throw "Ásbrú not found on Windows PATH. Prefer -Launcher securecrt/putty/native." }
-      $c.Source
-    }
-    $startArgs = @("--config-dir=$AsbruCfgDir", "--no-splash")
-    foreach ($u in ($uuids -split "\s+")) {
-      if ($u) { $startArgs += "--start-uuid=$u" }
-    }
-    Start-Process -FilePath $bin -ArgumentList $startArgs
-    Write-Host "Ásbrú started with $($devices.Count) session(s)."
   }
 
   "securecrt" {
@@ -615,6 +588,6 @@ switch ($Launcher) {
   }
 
   default {
-    throw "Unknown launcher: $Launcher (use asbru|securecrt|putty|native|wt|powershell|cmd|wireshark|edgeshark). Try -ListLaunchers."
+    throw "Unknown launcher: $Launcher (use late|securecrt|putty|native|wt|powershell|cmd|wireshark|edgeshark). Try -ListLaunchers."
   }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local encrypted device credentials for Ásbrú autofill.
+"""Local encrypted device credentials for launcher autofill.
 
 Stored ONLY under the user's config directory — never in the repo:
 

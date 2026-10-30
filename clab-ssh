@@ -26,8 +26,6 @@ SAVE_DEVICE_CREDS=0
 FORGET_DEVICE_CREDS=0
 NO_DEVICE_CREDS=0
 LAUNCHER="${CLAB_LAUNCHER:-}"
-ASBRU_BIN="${ASBRU_BIN:-}"
-ASBRU_CFG_DIR="${ASBRU_CFG_DIR:-$HOME/asbru-clab}"
 SECURECRT_BIN="${SECURECRT_BIN:-}"
 SECURECRT_JUMP_SESSION="${SECURECRT_JUMP_SESSION:-}"
 PUTTY_BIN="${PUTTY_BIN:-}"
@@ -62,13 +60,12 @@ Options:
   -H, --host HOST         Containerlab host (saved for next runs)
   -U, --ssh-user U        Linux username on the clab host
   -u, --user USER         Device SSH username (default: ${CLAB_USER})
-  -t, --launcher NAME     asbru|securecrt|putty|native|wt|powershell|cmd|wireshark|edgeshark
+  -t, --launcher NAME     late|securecrt|putty|native|wt|powershell|cmd|wireshark|edgeshark
   --list-launchers        Show which launchers are available here
   --no-jump               Connect directly (no jump host)
-  --save-device-creds     Save/update encrypted device user+password (Ásbrú)
+  --save-device-creds     Save/update encrypted device user+password
   --forget-device-creds   Delete local credential vault
-  --no-device-creds       Skip vault; prompt for device passwords in Ásbrú
-  --asbru PATH            Ásbrú binary
+  --no-device-creds       Skip vault; prompt for device passwords in the terminal
   --securecrt PATH        SecureCRT binary
   --putty PATH            PuTTY binary
   --jump-session NAME     SecureCRT/PuTTY saved jump session (optional)
@@ -90,7 +87,7 @@ Edgeshark (-t edgeshark): open the Edgeshark web UI (direct if reachable,
 
 Environment:
   CLAB_HOST, CLAB_USER, SSH_USER, CLAB_LAUNCHER, CLAB_SSH_CONFIG
-  ASBRU_BIN, ASBRU_CFG_DIR
+  LATE_DAEMON_URL, LATE_CONFIG
   SECURECRT_BIN, SECURECRT_JUMP_SESSION
   PUTTY_BIN, PUTTY_JUMP_SESSION
   TERMINAL_CMD
@@ -98,7 +95,7 @@ Environment:
 
 Local settings (never committed to git):
   ~/.config/clab-ssh/config              host / ssh user
-  ~/.config/clab-ssh/credentials.vault   encrypted device credentials (Ásbrú)
+  ~/.config/clab-ssh/credentials.vault   encrypted device credentials
 EOF
 }
 
@@ -126,7 +123,10 @@ while [[ $# -gt 0 ]]; do
     --save-device-creds) SAVE_DEVICE_CREDS=1; shift ;;
     --forget-device-creds) FORGET_DEVICE_CREDS=1; shift ;;
     --no-device-creds) NO_DEVICE_CREDS=1; shift ;;
-    --asbru) need_arg "$@"; ASBRU_BIN="$2"; shift 2 ;;
+    --asbru)
+      echo "Ásbrú is no longer used. Sessions open inside Late (-t late)." >&2
+      exit 1
+      ;;
     --securecrt) need_arg "$@"; SECURECRT_BIN="$2"; shift 2 ;;
     --putty) need_arg "$@"; PUTTY_BIN="$2"; shift 2 ;;
     --wireshark) need_arg "$@"; WIRESHARK_BIN="$2"; shift 2 ;;
@@ -161,7 +161,7 @@ need() {
 # Refuse to run as root/sudo. Local root is never needed (the jump SSH uses your
 # login; remote netns/docker use *remote* sudo). Running under sudo makes the
 # saved config in ~/.config/clab-ssh and the GUI hand-off (Wireshark/Edgeshark,
-# Ásbrú) unusable by your normal desktop session — the classic "capture window
+# Late) unusable by your normal desktop session — the classic "capture window
 # closes instantly" symptom.
 if [[ "${EUID:-$(id -u)}" -eq 0 && "${CLAB_ALLOW_ROOT:-0}" != "1" ]]; then
   echo "Refusing to run as root/sudo." >&2
@@ -226,7 +226,7 @@ JUMP_TARGET="${SSH_USER}@${CLAB_HOST}"
 CONTROL_PATH=""
 SOCKS_PORT=""
 
-# Open one jump tunnel (password once): ControlMaster for discovery + SOCKS for Ásbrú.
+# Open one jump tunnel (password once): ControlMaster for discovery + SOCKS for Late.
 open_jump_master() {
   local cm_dir askpass jump_password known_hosts
   cm_dir="${HOME}/.config/clab-ssh/ssh-cm"
@@ -241,7 +241,7 @@ open_jump_master() {
   # Reuse an already-open master if one is alive, so concurrent clab-ssh runs
   # (e.g. a Wireshark capture AND a terminal session) share a single tunnel
   # instead of tearing each other's down. The SOCKS port is stashed alongside
-  # the socket so a reusing run can still hand it to Ásbrú.
+  # the socket so a reusing run can hand it to Late.
   local socks_file="${cm_dir}/socks_port"
   if ssh -O check -S "$CONTROL_PATH" "$JUMP_TARGET" >/dev/null 2>&1; then
     local saved_port=""
@@ -280,7 +280,7 @@ ASK
   export SSH_ASKPASS="$askpass"
   export SSH_ASKPASS_REQUIRE=force
 
-  # -D = local SOCKS for Ásbrú (snap cannot use host ControlMaster sockets)
+  # -D = local SOCKS so Late can reuse this authenticated jump.
   if ! ssh -fN -M -S "$CONTROL_PATH" \
     -D "127.0.0.1:${SOCKS_PORT}" \
     -o StrictHostKeyChecking=accept-new \
@@ -347,8 +347,9 @@ detect_default_launcher() {
   uname_s="$(uname -s 2>/dev/null || echo unknown)"
   case "$uname_s" in
     Linux*)
-      if command -v asbru >/dev/null 2>&1 || command -v asbru-cm >/dev/null 2>&1; then
-        echo asbru
+      # Late replaces Ásbrú as the tabbed connection manager when it is running.
+      if [[ "$(python3 "${LIB_DIR}/late_launch.py" probe 2>/dev/null || true)" == "yes" ]]; then
+        echo late
       else
         echo native
       fi
@@ -367,20 +368,6 @@ if [[ -z "$LAUNCHER" ]]; then
 fi
 
 LAUNCHER="$(echo "$LAUNCHER" | tr '[:upper:]' '[:lower:]')"
-
-resolve_asbru() {
-  if [[ -n "$ASBRU_BIN" ]]; then
-    return 0
-  fi
-  if command -v asbru >/dev/null 2>&1; then
-    ASBRU_BIN="$(command -v asbru)"
-  elif command -v asbru-cm >/dev/null 2>&1; then
-    ASBRU_BIN="$(command -v asbru-cm)"
-  else
-    echo "Ásbrú not found. Install asbru-cm or set ASBRU_BIN / use -t native." >&2
-    exit 1
-  fi
-}
 
 resolve_securecrt() {
   if [[ -n "$SECURECRT_BIN" ]]; then
@@ -631,14 +618,17 @@ mk_pw_file() {
   printf '%s' "$f"
 }
 
-launch_asbru() {
-  resolve_asbru
+launch_late() {
+  if [[ "${1:-}" == "asbru" ]]; then
+    echo "Ásbrú is no longer used. Opening these nodes in Late."
+  fi
 
   load_device_credentials
   local device_user="$DEVICE_USER"
   local device_password="$DEVICE_PASSWORD"
 
-  # Reuse the jump tunnel opened before discovery (SOCKS for Ásbrú snap).
+  # Reuse the jump tunnel opened before discovery. Late connects through it
+  # so the jump password is not prompted again for every node.
   local control_path="${CONTROL_PATH:-}"
   local socks_port="${SOCKS_PORT:-}"
   if [[ "$NO_JUMP" -eq 0 && -z "$socks_port" ]]; then
@@ -647,19 +637,15 @@ launch_asbru() {
     control_path="${CONTROL_PATH:-}"
     socks_port="${SOCKS_PORT:-}"
   fi
-  if [[ "$NO_JUMP" -eq 0 && -z "$socks_port" ]]; then
-    echo "Jump SOCKS tunnel is required for Ásbrú." >&2
+  if [[ "$NO_JUMP" -eq 0 && -z "$socks_port" && ! -S "${control_path}" ]]; then
+    echo "A jump tunnel is required so Late can reach node management IPs." >&2
     exit 1
   fi
 
-  mkdir -p "$ASBRU_CFG_DIR"
-  touch "${ASBRU_CFG_DIR}/known_hosts"
-  chmod 600 "${ASBRU_CFG_DIR}/known_hosts" 2>/dev/null || true
-
-  local uuids
   local extra=()
   [[ "$NO_JUMP" -eq 1 ]] && extra+=(--no-jump)
   [[ -n "$socks_port" ]] && extra+=(--socks-port "$socks_port")
+  [[ -n "$control_path" && -S "$control_path" ]] && extra+=(--control-path "$control_path")
 
   if [[ -n "$device_password" ]]; then
     export CLAB_DEVICE_PASSWORD="$device_password"
@@ -667,54 +653,23 @@ launch_asbru() {
     unset CLAB_DEVICE_PASSWORD || true
   fi
 
-  uuids="$(python3 "${LIB_DIR}/asbru_config.py" \
-    --cfg-dir "$ASBRU_CFG_DIR" \
+  echo "Opening ${#DEVICE_JSON_LINES[@]} session(s) in Late..."
+  if ! python3 "${LIB_DIR}/late_launch.py" \
     --host "$CLAB_HOST" \
     --ssh-user "$SSH_USER" \
     --device-user "$device_user" \
     --devices-json "$DEVICES_JSON" \
-    "${extra[@]+"${extra[@]}"}")"
+    "${extra[@]+"${extra[@]}"}"; then
+    unset CLAB_DEVICE_PASSWORD || true
+    device_password=""
+    vault_json=""
+    exit 1
+  fi
   unset CLAB_DEVICE_PASSWORD || true
   device_password=""
   vault_json=""
-
-  uuids="$(echo "$uuids" | tr -d '\r')"
-  uuids="$(printf '%s\n' "$uuids" | awk 'NF{line=$0} END{print line}')"
-  if [[ -z "$uuids" ]]; then
-    echo "Failed to build Ásbrú connections." >&2
-    exit 1
-  fi
-
-  local args=(--config-dir="$ASBRU_CFG_DIR" --no-splash)
-  local u
-  for u in $uuids; do
-    args+=(--start-uuid="$u")
-  done
-
-  echo "Launching Ásbrú (${#DEVICE_JSON_LINES[@]} session(s))..."
-  if pgrep -f '[a]sbru-cm|/snap/asbru/.*/bin/asbru' >/dev/null 2>&1; then
-    echo "Ásbrú is already running — restarting with clab connections..."
-    pkill -f '[a]sbru-cm|/snap/asbru/.*/bin/asbru' 2>/dev/null || true
-    for _ in $(seq 1 20); do
-      pgrep -f '[a]sbru-cm|/snap/asbru/.*/bin/asbru' >/dev/null 2>&1 || break
-      sleep 0.25
-    done
-    sleep 0.5
-  fi
-
-  "$ASBRU_BIN" "${args[@]}" &
-  local pid=$!
-  disown "$pid" 2>/dev/null || true
-  sleep 1.5
-  if kill -0 "$pid" 2>/dev/null; then
-    echo "Ásbrú started (pid $pid)."
-    if [[ -n "$socks_port" ]]; then
-      echo "Jump SOCKS: 127.0.0.1:${socks_port} (keep this tunnel up while using Ásbrú)."
-    fi
-  else
-    echo "Ásbrú exited immediately. Try: $ASBRU_BIN ${args[*]}" >&2
-    [[ -n "$control_path" ]] && ssh -O exit -S "$control_path" "$JUMP_TARGET" 2>/dev/null || true
-    exit 1
+  if [[ -n "$socks_port" ]]; then
+    echo "Jump SOCKS: 127.0.0.1:${socks_port} (keep this tunnel up while the Late sessions are open)."
   fi
 }
 
@@ -1274,11 +1229,12 @@ if [[ "$NO_JUMP" -eq 0 ]]; then
 else
   echo "Jump host: (none)"
 fi
-echo "Jump tunnel already opened (device passwords autofill for asbru; native/putty where supported)."
+echo "Jump tunnel already opened (device passwords autofill in Late when the tunnel is up; native/putty where supported)."
 echo
 
 case "$LAUNCHER" in
-  asbru) launch_asbru ;;
+  late) launch_late ;;
+  asbru) launch_late asbru ;;
   securecrt) launch_securecrt ;;
   putty) launch_putty ;;
   native) launch_native 0 ;;
@@ -1289,7 +1245,7 @@ case "$LAUNCHER" in
   edgeshark) launch_edgeshark ;;
   *)
     echo "Unknown launcher: $LAUNCHER" >&2
-    echo "Use: asbru|securecrt|putty|native|wt|powershell|cmd|wireshark|edgeshark" >&2
+    echo "Use: late|securecrt|putty|native|wt|powershell|cmd|wireshark|edgeshark" >&2
     echo "See: ./clab-ssh --list-launchers" >&2
     exit 1
     ;;

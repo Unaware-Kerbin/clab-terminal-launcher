@@ -37,14 +37,21 @@ def find_first(candidates: list[str]) -> str | None:
 def probe() -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
 
-    asbru = find_first(["asbru", "asbru-cm"])
+    try:
+        import late_launch
+
+        late_up = late_launch.daemon_up()
+        late_path = late_launch.daemon_url()
+    except Exception:
+        late_up = False
+        late_path = "http://127.0.0.1:7420"
     rows.append(
         {
-            "name": "asbru",
-            "available": "yes" if asbru else "no",
-            "path": asbru or "",
-            "platforms": "Linux (primary), others if installed",
-            "jump": "built-in (no saved session needed)",
+            "name": "late",
+            "available": "yes" if late_up else "no",
+            "path": late_path if late_up else "",
+            "platforms": "Linux, macOS, Windows (Late must be open)",
+            "jump": "SOCKS tunnel into Late, else OpenSSH ProxyJump",
         }
     )
 

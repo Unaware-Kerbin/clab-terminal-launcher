@@ -12,7 +12,8 @@ The lab host is never hardcoded — you enter it once and it's saved locally. Ju
 ## Requirements
 
 - OpenSSH client (`ssh`)
-- Python 3 — plus `PyYAML` and `cryptography` for the encrypted vault / Ásbrú (`pip install -r requirements.txt`)
+- Python 3 — plus `cryptography` for the encrypted vault (`pip install -r requirements.txt`)
+- [Late](https://github.com/unaware-kerbin/late) open on this computer for the `late` launcher (the tabbed sessions). Ásbrú is not used.
 - `clab` on the lab host
 - Whichever terminal app you launch (see the matrix below)
 - Optional: `sshpass` for device-password autofill with the `native` launcher; PuTTY 0.77+ for PuTTY autofill
@@ -24,8 +25,8 @@ The lab host is never hardcoded — you enter it once and it's saved locally. Ju
 chmod +x clab-ssh
 ./clab-ssh --list-launchers   # what's available on THIS machine
 ./clab-ssh -l                 # list running nodes
-./clab-ssh -t native          # open all nodes
-./clab-ssh -t asbru pe-1 ce-1 # open specific nodes in Ásbrú
+./clab-ssh -t native          # open all nodes in an OS terminal
+./clab-ssh -t late pe-1 ce-1  # open specific nodes inside Late
 ```
 
 ```powershell
@@ -42,7 +43,7 @@ Any launcher can be selected on any OS with `-t NAME` / `-Launcher NAME` (or `CL
 
 | Launcher | Name | Linux | macOS | Windows | WSL | Jump without a saved session |
 |---|---|:--:|:--:|:--:|:--:|---|
-| Ásbrú | `asbru` | ✓ | ✓ | ✓ | ✓ | built-in (SOCKS tunnel) |
+| Late | `late` | ✓ | ✓ | ✓ | ✓ | SOCKS tunnel into Late (else OpenSSH `-J`) |
 | SecureCRT | `securecrt` | ✓ | ✓ | ✓ | ✓ | falls back to OpenSSH `-J` |
 | PuTTY | `putty` | ✓ | rare | ✓ | ✓ | `-proxycmd` + OpenSSH |
 | Native OpenSSH | `native` | ✓ | ✓ | ✓ | ✓ | `ssh -J` |
@@ -52,7 +53,7 @@ Any launcher can be selected on any OS with `-t NAME` / `-Launcher NAME` (or `CL
 | Wireshark capture | `wireshark` | ✓ | ✓ | ✓ | ✓ | reuses the jump tunnel |
 | Edgeshark UI | `edgeshark` | ✓ | ✓ | ✓ | ✓ | forwards the UI through the jump |
 
-**Defaults:** Linux → `asbru` if installed, else `native`; macOS → `native`; Windows → `securecrt` → `putty` → `native`.
+**Defaults:** Linux → `late` when Late is already running, else `native`; macOS → `native`; Windows → `securecrt` → `putty` → `native`. `-t asbru` opens Late and tells you Ásbrú is no longer used.
 
 `native` auto-picks the first terminal it finds (Ptyxis, GNOME Terminal, Konsole, XFCE/MATE, Kitty, Alacritty, `x-terminal-emulator`, iTerm/Terminal.app, or Windows Terminal/PowerShell under WSL). Override the spawn command with `TERMINAL_CMD`.
 
@@ -125,7 +126,7 @@ The one-time local step is installing the [`cshargextcap`](https://github.com/si
 The device username and password can be stored once in a local encrypted vault and replayed on connect. You never edit code — the first eligible run offers to save them, and you can manage the vault explicitly:
 
 ```bash
-./clab-ssh -t asbru --save-device-creds    # create/update the vault
+./clab-ssh -t late --save-device-creds     # create/update the vault
 ./clab-ssh --forget-device-creds           # delete the vault
 ./clab-ssh -t native --no-device-creds     # skip the vault this run
 ```
@@ -142,7 +143,7 @@ Support varies by launcher and is intentionally limited to methods that don't le
 
 | Launcher | Autofill | How |
 |---|---|---|
-| Ásbrú | yes | encrypted config entry |
+| Late | yes | Late's secret store, via the jump tunnel |
 | native / `wt` (Linux, macOS) | yes | `sshpass -f` (temp file) — requires `sshpass` |
 | PuTTY (native build, incl. Windows) | yes | `-pwfile` (temp file) — requires PuTTY 0.77+ |
 | SecureCRT | no | interactive (its `/PASSWORD` would expose the password in `ps`) |
@@ -150,7 +151,7 @@ Support varies by launcher and is intentionally limited to methods that don't le
 
 Where autofill isn't available you're simply prompted as usual. Temp password files are `600` and shredded seconds after launch.
 
-> **Note:** Ásbrú's generated `~/asbru-clab/asbru.yml` also holds a runtime copy of the device password that is only *obfuscated* (public key). The vault is the secure store; treat the YAML as local-only and remove it after use if that matters to you.
+> **Note:** The vault is the secure store. Late saves the device password in its own `0600` secret file only when you launch with autofill. The jump password is never stored. Old `~/asbru-clab/` files are unused; delete that directory if it is still on disk.
 
 ## Local settings (never in git)
 
@@ -158,7 +159,7 @@ Where autofill isn't available you're simply prompted as usual. Temp password fi
 |---|---|
 | `~/.config/clab-ssh/config` | Lab host + jump SSH username |
 | `~/.config/clab-ssh/credentials.vault` | Encrypted device user + password |
-| `~/asbru-clab/` | Generated Ásbrú runtime config |
+| Late inventory | Folder `clab-<lab-host>` with one SSH row per node |
 
 Set `CLAB_SSH_CONFIG` to relocate the config file (the vault stays a sibling named `credentials.vault`).
 
@@ -185,7 +186,7 @@ Set `CLAB_SSH_CONFIG` to relocate the config file (the vault stays a sibling nam
 | `--edgeshark-local-port` / `-EdgesharkLocalPort` | Local tunnel port (`edgeshark`) | same, else auto |
 | `--no-open` / `-NoOpen` | Don't auto-open the browser (`edgeshark`) | off |
 | `CLAB_SSH_CONFIG` | Override the settings file path | `~/.config/clab-ssh/config` |
-| `ASBRU_BIN` / `ASBRU_CFG_DIR` | Ásbrú binary / config dir | auto / `~/asbru-clab` |
+| `LATE_DAEMON_URL` / `LATE_CONFIG` | Late daemon / config dir | `http://127.0.0.1:7420` / Late's config dir |
 | `SECURECRT_BIN` / `SECURECRT_JUMP_SESSION` | SecureCRT path / jump session | |
 | `PUTTY_BIN` / `PUTTY_JUMP_SESSION` | PuTTY path / jump session | |
 | `TERMINAL_CMD` | Override the native terminal spawn | |
@@ -196,7 +197,7 @@ Set `CLAB_SSH_CONFIG` to relocate the config file (the vault stays a sibling nam
 clab-ssh              # bash CLI
 clab-ssh.ps1          # PowerShell CLI
 lib/discover.py       # node discovery
-lib/asbru_config.py   # Ásbrú YAML writer
+lib/late_launch.py    # open the nodes inside Late
 lib/list_launchers.py # availability probe
 lib/user_config.py    # persistent non-secret settings
 lib/credentials.py    # encrypted device vault
